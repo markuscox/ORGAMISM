@@ -1,0 +1,6 @@
+{
+  "name": "ORGANISM — Cognitive Kernel Observatory",
+  "description": "Stage 1 modular artificial cognitive system with persistent SQLite checkpoints, 16-step wake cycles, safety boundaries, and token economy telemetry.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

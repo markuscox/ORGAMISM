@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "organism"
+version = "0.1.0"
+description = "Experimental modular artificial cognitive architecture (Stage 1 foundation)"
+requires-python = ">=3.10"
+readme = "README.md"
+
+[tool.pytest.ini_options]
+testpaths = ["organism/tests"]
+pythonpath = ["."]

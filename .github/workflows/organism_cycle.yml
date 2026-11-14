@@ -1,0 +1,109 @@
+name: ORGANISM Wake Cycle
+
+on:
+  workflow_dispatch:
+    inputs:
+      event_text:
+        description: "Incoming stimulus text for this wake cycle"
+        required: false
+        default: "calc: 21 * 2"
+      event_source:
+        description: "Source identifier"
+        required: false
+        default: "github_actions_dispatch"
+      mode:
+        description: "Reasoning mode (auto | deterministic_only | gemini_assisted)"
+        required: false
+        default: "auto"
+  schedule:
+    # Conservative 6-hour discrete wake cycle
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: organism-state-persistence
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  wake-cycle:
+    runs-on: ubuntu-latest
+    env:
+      ORGANISM_STATE_DIR: ./state
+    steps:
+      - name: Checkout code branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore private organism-state branch
+        run: |
+          git config user.name "organism-runner[bot]"
+          git config user.email "organism-runner[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin organism-state >/dev/null 2>&1; then
+            git fetch origin organism-state
+            git checkout -B organism-state-tmp origin/organism-state
+            mkdir -p state
+            cp -r state/. ./state_restored/ 2>/dev/null || true
+            git checkout "${{ github.ref_name }}"
+            rm -rf state
+            mkdir -p state
+            cp -r ./state_restored/. ./state/ 2>/dev/null || true
+            rm -rf ./state_restored
+          else
+            mkdir -p state
+          fi
+
+      - name: Run automated Stage 1 verification tests
+        run: |
+          python3 -m unittest discover -s organism/tests -v
+
+      - name: Resume interrupted work or execute wake cycle
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          mkdir -p logs
+          python3 main.py resume > logs/resume_output.json
+          EVENT_TEXT="${{ github.event.inputs.event_text || 'Scheduled wake check: verify state integrity and report status?' }}"
+          EVENT_SOURCE="${{ github.event.inputs.event_source || 'github_actions_schedule' }}"
+          MODE="${{ github.event.inputs.mode || 'auto' }}"
+          OP_ID="gha-${{ github.run_id }}-${{ github.run_attempt }}"
+          python3 main.py wake \
+            --event "$EVENT_TEXT" \
+            --source "$EVENT_SOURCE" \
+            --trust trusted_operator \
+            --operation-id "$OP_ID" \
+            --mode "$MODE" > logs/wake_output.json
+
+      - name: Commit updated persistent state to organism-state branch
+        run: |
+          mkdir -p /tmp/organism_state_backup
+          cp -r state/* /tmp/organism_state_backup/
+          if git ls-remote --exit-code --heads origin organism-state >/dev/null 2>&1; then
+            git fetch origin organism-state
+            git checkout -B organism-state origin/organism-state
+          else
+            git checkout --orphan organism-state
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+          mkdir -p state
+          cp -r /tmp/organism_state_backup/* state/
+          git add state/
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(state): persist wake cycle ${{ github.run_id }}"
+            git push origin organism-state
+          else
+            echo "No state changes to commit."
+          fi
+
+      - name: Upload cycle telemetry logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: organism-cycle-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 14

@@ -1,0 +1,31 @@
+{
+  "identity": {
+    "organism_id": "organism-stage1-alpha",
+    "version": "0.1.0-stage1"
+  },
+  "model": {
+    "provider": "gemini",
+    "model_name": "gemini-4-hydrogen",
+    "timeout_seconds": 20,
+    "max_retries": 2,
+    "backoff_base_seconds": 1.0
+  },
+  "budgets": {
+    "daily_token_limit": 200000,
+    "daily_request_limit": 200,
+    "cycle_token_limit": 25000,
+    "context_char_limit": 6000,
+    "max_loop_depth": 4
+  },
+  "memory": {
+    "workspace_capacity": 7,
+    "working_memory_capacity": 12,
+    "working_memory_ttl_cycles": 6,
+    "retrieval_top_k": 5
+  },
+  "storage": {
+    "state_dir": "state",
+    "db_filename": "organism_state.db",
+    "snapshot_filename": "latest_checkpoint.json"
+  }
+}
