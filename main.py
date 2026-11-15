@@ -13,6 +13,8 @@ from organism.evaluation.benchmarks import run_all_benchmarks
 from organism.integrations.telegram import TelegramBridge
 from organism.kernel.contracts import CognitiveEvent, TrustLevel
 from organism.kernel.runtime import CognitiveKernel
+from organism.models.gemini import GeminiProvider
+from organism.models.provider import ProviderError
 from organism.safety.state_crypto import (
     StateCryptoError,
     StateEncryptor,
@@ -93,6 +95,19 @@ def build_parser() -> argparse.ArgumentParser:
     verify_git.add_argument("--repo-dir", required=True, help="Checked-out organism-state repository directory")
     verify_git.add_argument("--check-history", action="store_true", help="Also verify full commit history contains zero plaintext")
 
+    verify_bundle = sub.add_parser(
+        "state-verify-bundle",
+        help="Decrypt Fernet bundle into temp dir, check SQLite/snapshot integrity, and compare tables with state-dir",
+    )
+    verify_bundle.add_argument("--encrypted-dir", default="encrypted_state", help="Directory containing encrypted bundle")
+    verify_bundle.add_argument(
+        "--expected-state-dir",
+        default=None,
+        help="Optional local state_dir to compare against decrypted bundle contents",
+    )
+
+    sub.add_parser("gemini-probe", help="Verify live Gemini API connectivity, response, and usageMetadata safely")
+
     tg = sub.add_parser("telegram-poll", help="Poll Telegram Bot API once and process verified owner updates")
     tg.add_argument("--limit", type=int, default=25, help="Maximum updates to fetch")
     tg.add_argument("--timeout", type=int, default=5, help="Telegram long-poll timeout in seconds")
@@ -119,6 +134,35 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         except StateCryptoError as exc:
             print(json.dumps({"error": str(exc)}), file=sys.stderr)
+            return 2
+
+    if args.command == "state-verify-bundle":
+        try:
+            encryptor = StateEncryptor()
+            expected_dir = Path(args.expected_state_dir) if args.expected_state_dir else None
+            res = encryptor.verify_bundle_matches_state(
+                encrypted_dir=Path(args.encrypted_dir),
+                expected_state_dir=expected_dir,
+            )
+            print(json.dumps(res, indent=2, ensure_ascii=True))
+            return 0
+        except StateCryptoError as exc:
+            print(json.dumps({"error": str(exc)}), file=sys.stderr)
+            return 2
+
+    if args.command == "gemini-probe":
+        provider = GeminiProvider(
+            model_name=config.model_name,
+            timeout_seconds=config.timeout_seconds,
+            max_retries=config.max_retries,
+            backoff_base_seconds=config.backoff_base_seconds,
+        )
+        try:
+            res = provider.probe()
+            print(json.dumps(res, indent=2, ensure_ascii=True))
+            return 0
+        except ProviderError as exc:
+            print(json.dumps({"ok": False, "model_name": config.model_name, "error": str(exc)}), file=sys.stderr)
             return 2
 
     if args.command == "state-migrate-restore":

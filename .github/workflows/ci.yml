@@ -5,9 +5,35 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  workflow_dispatch:
 
 jobs:
-  verify:
+  workflow-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate workflow invariants
+        run: python3 scripts/validate_workflows.py
+
+      - name: Install actionlint
+        run: |
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz" \
+            -o "$RUNNER_TEMP/actionlint.tar.gz"
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP/actionlint" actionlint
+          chmod +x "$RUNNER_TEMP/actionlint/actionlint"
+
+      - name: Lint GitHub Actions workflows with actionlint
+        run: '"$RUNNER_TEMP/actionlint/actionlint" .github/workflows/*.yml'
+
+  python-tests:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -21,14 +47,17 @@ jobs:
       - name: Install Python dependencies
         run: python3 -m pip install -r requirements.txt
 
-      - name: Validate GitHub Actions workflows
-        run: python3 scripts/validate_workflows.py
-
       - name: Run Python unit tests (Stage 1 + Stage 2 + Stage 3)
         run: python3 -m unittest discover -s organism/tests -v
 
       - name: Run deterministic capability benchmarks
-        run: python3 main.py --state-dir "${{ runner.temp }}/ci_eval_state" eval
+        run: python3 main.py --state-dir "$RUNNER_TEMP/ci_eval_state" eval
+
+  node-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Node.js 22
         uses: actions/setup-node@v4
@@ -44,3 +73,30 @@ jobs:
 
       - name: Vite production build
         run: npm run build
+
+  gemini-probe:
+    needs: [workflow-lint, python-tests, node-build]
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: python3 -m pip install -r requirements.txt
+
+      - name: Verify live Gemini 3.8 Flash API when GEMINI_API_KEY is configured
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ORGANISM_MODEL_NAME: gemini-3.8-flash
+        run: |
+          if [ -n "$GEMINI_API_KEY" ]; then
+            python3 main.py gemini-probe
+          else
+            echo "GEMINI_API_KEY not configured in this repository environment; skipping live Gemini probe."
+          fi

@@ -92,16 +92,26 @@ class GeminiProvider(ModelProvider):
                 status = exc.code
                 detail = exc.read().decode("utf-8", errors="replace")[:300]
                 detail_safe = self._sanitize_error_text(detail, api_key)
+                if status in (401, 403):
+                    raise ProviderError(
+                        f"Gemini HTTP {status} authentication/authorization error ({self.model_name}): {detail_safe}"
+                    ) from None
+                if status == 404:
+                    raise ProviderError(
+                        f"Gemini HTTP 404 model/endpoint not found ({self.model_name}): {detail_safe}"
+                    ) from None
                 if status == 429:
                     last_err = QuotaExhaustedError(f"Gemini HTTP 429 rate/quota limit: {detail_safe}")
                     if attempt < self.max_retries:
                         time.sleep(self.backoff_base_seconds * (2**attempt))
                         continue
                     raise last_err from None
-                if status >= 500 and attempt < self.max_retries:
-                    last_err = ProviderError(f"Gemini HTTP {status}: {detail_safe}")
-                    time.sleep(self.backoff_base_seconds * (2**attempt))
-                    continue
+                if status >= 500:
+                    last_err = ProviderError(f"Gemini HTTP {status} server error ({self.model_name}): {detail_safe}")
+                    if attempt < self.max_retries:
+                        time.sleep(self.backoff_base_seconds * (2**attempt))
+                        continue
+                    raise last_err from None
                 raise ProviderError(f"Gemini HTTP {status} ({self.model_name}): {detail_safe}") from None
             except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
                 msg = self._sanitize_error_text(str(getattr(exc, "reason", exc)), api_key)
@@ -112,6 +122,28 @@ class GeminiProvider(ModelProvider):
                 raise last_err from None
 
         raise ProviderError(f"Gemini request failed after retries: {last_err}")
+
+    def probe(self) -> dict[str, Any]:
+        """Run a minimal read-only verification request against the configured Gemini model without exposing secrets."""
+        resp = self.generate(
+            ModelRequest(
+                system_instruction="Respond concisely with ACK.",
+                prompt="Reply with: ACK",
+                max_output_tokens=16,
+            )
+        )
+        return {
+            "ok": True,
+            "http_status": 200,
+            "provider": resp.provider,
+            "model_name": resp.model_name,
+            "response_preview": resp.text[:120],
+            "usage": {
+                "prompt_tokens": resp.prompt_tokens,
+                "completion_tokens": resp.completion_tokens,
+                "total_tokens": resp.total_tokens,
+            },
+        }
 
     def _parse_response(self, raw: dict[str, Any], api_key: str = "") -> ModelResponse:
         if isinstance(raw, dict) and "error" in raw:

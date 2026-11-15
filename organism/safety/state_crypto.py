@@ -299,6 +299,55 @@ class StateEncryptor:
             "backend": self.backend_name,
         }
 
+    def verify_bundle_matches_state(
+        self,
+        encrypted_dir: Path,
+        expected_state_dir: Path | None = None,
+    ) -> dict[str, Any]:
+        """
+        Decrypt an encrypted bundle into an isolated temporary directory, verify SQLite & snapshot
+        integrity, and assert all state tables match `expected_state_dir` when provided.
+        """
+        encrypted_dir = Path(encrypted_dir)
+        with tempfile.TemporaryDirectory() as verify_tmp:
+            verify_dir = Path(verify_tmp) / "unpacked"
+            unpack_info = self.unpack_state_dir(encrypted_dir, verify_dir)
+            integrity_info = verify_plaintext_state_dir(verify_dir)
+            unpacked_db = verify_dir / "organism_state.db"
+            bundle_state = inspect_sqlite_state(unpacked_db) if unpacked_db.exists() else None
+
+            if expected_state_dir is not None:
+                expected_dir = Path(expected_state_dir)
+                expected_db = expected_dir / "organism_state.db"
+                if expected_db.exists():
+                    if bundle_state is None:
+                        raise StateCryptoError(
+                            "Encrypted bundle does not contain organism_state.db while expected state does."
+                        )
+                    expected_state = inspect_sqlite_state(expected_db)
+                    for field in (
+                        "telegram_offset",
+                        "processed_update_ids",
+                        "semantic_facts",
+                        "episodes",
+                        "checkpoints",
+                        "idempotency_ledger",
+                        "dialogue_sessions",
+                    ):
+                        if bundle_state[field] != expected_state[field]:
+                            raise StateCryptoError(
+                                f"Encrypted bundle state mismatch for '{field}': "
+                                f"bundle={bundle_state[field]!r} != expected={expected_state[field]!r}"
+                            )
+
+        return {
+            "verified": True,
+            "file_count": unpack_info["file_count"],
+            "restored_files": unpack_info["restored_files"],
+            "snapshot_verified": integrity_info["snapshot_verified"],
+            "sqlite_state": bundle_state,
+        }
+
     def migrate_or_restore(
         self,
         state_dir: Path,
@@ -400,6 +449,103 @@ def verify_sqlite_integrity(db_path: Path) -> None:
             raise InvalidCiphertextError(f"SQLite integrity check failed for {db_path.name}.")
     except sqlite3.Error as exc:
         raise InvalidCiphertextError(f"SQLite unreadable or corrupted ({db_path.name}): {exc}") from exc
+    finally:
+        conn.close()
+
+
+def inspect_sqlite_state(db_path: Path) -> dict[str, Any]:
+    """Read real persisted tables from SQLite (offset, processed updates, facts, episodes, checkpoints, ledger, sessions)."""
+    db_path = Path(db_path)
+    verify_sqlite_integrity(db_path)
+    conn = sqlite3.connect(str(db_path), timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = {
+            str(r[0])
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+
+        telegram_offset = 0
+        if "telegram_state" in tables:
+            row = conn.execute("SELECT last_update_id FROM telegram_state WHERE id = 1").fetchone()
+            if row is not None:
+                telegram_offset = int(row["last_update_id"])
+
+        processed_update_ids: list[int] = []
+        if "telegram_processed_updates" in tables:
+            rows = conn.execute(
+                "SELECT update_id FROM telegram_processed_updates ORDER BY update_id ASC"
+            ).fetchall()
+            processed_update_ids = [int(r["update_id"]) for r in rows]
+
+        semantic_facts: list[list[str]] = []
+        if "semantic_facts" in tables:
+            rows = conn.execute(
+                """
+                SELECT subject, predicate, object_value, status
+                FROM semantic_facts
+                ORDER BY subject ASC, predicate ASC, object_value ASC, status ASC
+                """
+            ).fetchall()
+            semantic_facts = [
+                [str(r["subject"]), str(r["predicate"]), str(r["object_value"]), str(r["status"])]
+                for r in rows
+            ]
+
+        episodes: list[list[str]] = []
+        dialogue_sessions: list[str] = []
+        if "episodes" in tables:
+            rows = conn.execute(
+                """
+                SELECT episode_id, cycle_id, session_id, event_content
+                FROM episodes
+                ORDER BY sequence_index ASC, episode_id ASC
+                """
+            ).fetchall()
+            episodes = [
+                [str(r["episode_id"]), str(r["cycle_id"]), str(r["session_id"]), str(r["event_content"])]
+                for r in rows
+            ]
+            dialogue_sessions = sorted({str(r["session_id"]) for r in rows})
+
+        checkpoints: list[list[Any]] = []
+        if "checkpoints" in tables:
+            rows = conn.execute(
+                """
+                SELECT cycle_id, operation_id, status, current_step
+                FROM checkpoints
+                ORDER BY cycle_id ASC
+                """
+            ).fetchall()
+            checkpoints = [
+                [str(r["cycle_id"]), str(r["operation_id"]), str(r["status"]), int(r["current_step"])]
+                for r in rows
+            ]
+
+        idempotency_ledger: list[list[str]] = []
+        if "idempotency_ledger" in tables:
+            rows = conn.execute(
+                """
+                SELECT operation_id, cycle_id, status
+                FROM idempotency_ledger
+                ORDER BY operation_id ASC
+                """
+            ).fetchall()
+            idempotency_ledger = [
+                [str(r["operation_id"]), str(r["cycle_id"]), str(r["status"])]
+                for r in rows
+            ]
+
+        return {
+            "integrity": "ok",
+            "telegram_offset": telegram_offset,
+            "processed_update_ids": processed_update_ids,
+            "semantic_facts": semantic_facts,
+            "episodes": episodes,
+            "checkpoints": checkpoints,
+            "idempotency_ledger": idempotency_ledger,
+            "dialogue_sessions": dialogue_sessions,
+        }
     finally:
         conn.close()
 

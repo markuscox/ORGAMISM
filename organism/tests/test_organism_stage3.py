@@ -698,7 +698,10 @@ class OrganismStage3Tests(unittest.TestCase):
 
     def test_18_git_publish_script_removes_legacy_state_and_purges_history(self) -> None:
         import subprocess
-        from organism.safety.state_crypto import assert_clean_git_publish_tree
+        from organism.safety.state_crypto import (
+            assert_clean_git_publish_tree,
+            inspect_sqlite_state,
+        )
 
         bare_repo = Path(self.tmp_dir.name) / "remote.git"
         work_seed = Path(self.tmp_dir.name) / "seed"
@@ -720,7 +723,7 @@ class OrganismStage3Tests(unittest.TestCase):
         subprocess.run(["git", "rm", "-rf", "."], cwd=str(work_seed), check=True, capture_output=True)
         legacy_state_sub = work_seed / "state"
         k = CognitiveKernel(config=load_config(state_dir_override=legacy_state_sub))
-        k.run_cycle(
+        cp_git = k.run_cycle(
             CognitiveEvent(
                 event_id="ev_git_1",
                 operation_id="op_git_1",
@@ -728,15 +731,47 @@ class OrganismStage3Tests(unittest.TestCase):
                 trust_level=TrustLevel.TRUSTED_OPERATOR,
                 event_type="assertion",
                 content="fact: git_migration is preserved",
+                metadata={"session_id": "tg_session_test"},
             )
         )
         k.store.save_telegram_offset(424)
+        k.store.mark_telegram_update_processed(424)
         k.store.export_snapshot()
-        subprocess.run(["git", "add", "-f", "state/organism_state.db", "state/latest_checkpoint.json"], cwd=str(work_seed), check=True)
+
+        def _assert_sqlite_snapshot_intact(db_path: Path, stage_label: str) -> None:
+            st = inspect_sqlite_state(db_path)
+            self.assertEqual(st["telegram_offset"], 424, f"[{stage_label}] offset lost: {st}")
+            self.assertIn(424, st["processed_update_ids"], f"[{stage_label}] processed update lost: {st}")
+            self.assertTrue(
+                any(f[:3] == ["git_migration", "is", "preserved"] for f in st["semantic_facts"]),
+                f"[{stage_label}] semantic fact lost: {st}",
+            )
+            self.assertTrue(
+                any(ep[1] == cp_git.cycle_id for ep in st["episodes"]),
+                f"[{stage_label}] episode lost: {st}",
+            )
+            self.assertTrue(
+                any(cp[0] == cp_git.cycle_id and cp[1] == "op_git_1" for cp in st["checkpoints"]),
+                f"[{stage_label}] checkpoint lost: {st}",
+            )
+            self.assertTrue(
+                any(led[0] == "op_git_1" and led[1] == cp_git.cycle_id for led in st["idempotency_ledger"]),
+                f"[{stage_label}] idempotency ledger lost: {st}",
+            )
+            self.assertIn("tg_session_test", st["dialogue_sessions"], f"[{stage_label}] session lost: {st}")
+
+        # Diagnostic Stage 1: After writing offset and state in SQLite
+        _assert_sqlite_snapshot_intact(legacy_state_sub / "organism_state.db", "1_after_sqlite_write")
+
+        subprocess.run(
+            ["git", "add", "-f", "state/organism_state.db", "state/latest_checkpoint.json"],
+            cwd=str(work_seed),
+            check=True,
+        )
         subprocess.run(["git", "commit", "-m", "legacy plaintext state leak"], cwd=str(work_seed), check=True, capture_output=True)
         subprocess.run(["git", "push", "origin", "organism-state"], cwd=str(work_seed), check=True, capture_output=True)
 
-        # Isolated workflow-style restore -> migrate -> encrypt -> publish_encrypted_state.sh
+        # Isolated workflow-style fetch -> legacy inspect -> migrate_or_restore -> pack -> publish -> fresh clone
         state_repo_dir = Path(self.tmp_dir.name) / "state_repo"
         runtime_dir = Path(self.tmp_dir.name) / "wf_runtime"
         enc_dir = Path(self.tmp_dir.name) / "wf_enc"
@@ -749,12 +784,25 @@ class OrganismStage3Tests(unittest.TestCase):
         subprocess.run(["git", "fetch", "origin", "organism-state"], cwd=str(state_repo_dir), check=True, capture_output=True)
         subprocess.run(["git", "checkout", "-B", "organism-state", "FETCH_HEAD"], cwd=str(state_repo_dir), check=True, capture_output=True)
         for item in (state_repo_dir / "state").iterdir():
-            (legacy_copy / item.name).write_bytes(item.read_bytes())
+            if item.is_file():
+                (legacy_copy / item.name).write_bytes(item.read_bytes())
+
+        # Diagnostic Stage 2: After checking legacy DB fetched from remote branch
+        _assert_sqlite_snapshot_intact(legacy_copy / "organism_state.db", "2_after_legacy_db_check")
 
         key = generate_fernet_key()
         encryptor = StateEncryptor(key=key)
         mig = encryptor.migrate_or_restore(runtime_dir, enc_dir, legacy_state_dir=legacy_copy, allow_empty=False)
         self.assertEqual(mig["mode"], "migrated_legacy_plaintext")
+
+        # Diagnostic Stage 3: After migrate_or_restore
+        _assert_sqlite_snapshot_intact(runtime_dir / "organism_state.db", "3_after_migrate_or_restore")
+
+        # Explicit state-pack & Diagnostic Stage 4: verify packed encrypted bundle matches runtime SQLite
+        encryptor.pack_state_dir(runtime_dir, enc_dir)
+        bundle_check = encryptor.verify_bundle_matches_state(enc_dir, expected_state_dir=runtime_dir)
+        self.assertTrue(bundle_check["verified"])
+        self.assertEqual(bundle_check["sqlite_state"]["telegram_offset"], 424)
 
         repo_root = Path(__file__).resolve().parents[2]
         env = {
@@ -763,6 +811,8 @@ class OrganismStage3Tests(unittest.TestCase):
             "PYTHONPATH": str(repo_root),
             "STATE_REPO_DIR": str(state_repo_dir),
             "ENCRYPTED_DIR": str(enc_dir),
+            "ORGANISM_STATE_DIR": str(runtime_dir),
+            "ORGANISM_STATE_ENCRYPTION_KEY": key,
             "COMMIT_MESSAGE": "chore(state): encrypted migration test",
             "PURGE_PLAINTEXT_HISTORY": "false",
         }
@@ -775,9 +825,20 @@ class OrganismStage3Tests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, f"publish script failed: {proc.stdout}\n{proc.stderr}")
 
-        # Verify remote `organism-state` in a brand-new clone has ONLY encrypted files in tip AND full history
+        # Diagnostic Stage 5: After Git publish in isolated repo (verify clean tip & history + bundle offset)
+        self.assertTrue(assert_clean_git_publish_tree(state_repo_dir, check_history=True)["clean"])
+        published_check = encryptor.verify_bundle_matches_state(
+            state_repo_dir / "encrypted_state", expected_state_dir=runtime_dir
+        )
+        self.assertEqual(published_check["sqlite_state"]["telegram_offset"], 424)
+
+        # Diagnostic Stage 6: Fresh git clone verification
         verify_clone = Path(self.tmp_dir.name) / "verify_clone"
-        subprocess.run(["git", "clone", "--branch", "organism-state", "--single-branch", str(bare_repo), str(verify_clone)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "clone", "--branch", "organism-state", "--single-branch", str(bare_repo), str(verify_clone)],
+            check=True,
+            capture_output=True,
+        )
         audit = assert_clean_git_publish_tree(verify_clone, check_history=True)
         self.assertTrue(audit["clean"])
         self.assertTrue(audit["history_checked"])
@@ -786,12 +847,20 @@ class OrganismStage3Tests(unittest.TestCase):
         after_main_sha = subprocess.check_output(["git", "rev-parse", "refs/heads/main"], cwd=str(bare_repo), text=True).strip()
         self.assertEqual(after_main_sha, main_sha)
 
-        # Verify data restores accurately from the published encrypted branch after restart
+        # Diagnostic Stage 7: Decrypting cloned encrypted_state bundle into temp/rehydrated directory
         rehydrated = Path(self.tmp_dir.name) / "rehydrated"
         encryptor.migrate_or_restore(rehydrated, verify_clone / "encrypted_state", allow_empty=False)
+        _assert_sqlite_snapshot_intact(rehydrated / "organism_state.db", "7_after_decrypt")
+
+        # Diagnostic Stage 8: Brand-new CognitiveKernel initialized over rehydrated state
         k_re = CognitiveKernel(config=load_config(state_dir_override=rehydrated))
         self.assertEqual(k_re.store.get_telegram_offset(), 424)
+        self.assertTrue(k_re.store.is_telegram_update_processed(424))
         self.assertIsNotNone(k_re.store.find_semantic_triple("git_migration", "is", "preserved"))
+        self.assertTrue(any(ep["cycle_id"] == cp_git.cycle_id for ep in k_re.store.list_episodes()))
+        self.assertIsNotNone(k_re.store.get_checkpoint(cp_git.cycle_id))
+        self.assertIsNotNone(k_re.store.check_idempotency("op_git_1"))
+        self.assertTrue(any(ep.get("session_id") == "tg_session_test" for ep in k_re.store.list_episodes()))
 
     def test_19_gemini_provider_uses_gemini_3_8_flash_supports_override_and_handles_errors(self) -> None:
         from organism.models.gemini import GeminiProvider
@@ -806,7 +875,8 @@ class OrganismStage3Tests(unittest.TestCase):
             os.environ["ORGANISM_MODEL_NAME"] = "gemini-3.8-flash-custom"
             self.assertEqual(load_config(state_dir_override=self.state_dir).model_name, "gemini-3.8-flash-custom")
 
-            os.environ["GEMINI_API_KEY"] = "AIzaTestFakeGeminiKey1234567890"
+            fake_key = "AIzaTestFakeGeminiKey1234567890"
+            os.environ["GEMINI_API_KEY"] = fake_key
             captured_urls: list[str] = []
 
             def ok_opener(req: Any, timeout: int = 20) -> _FakeHTTPResponse:
@@ -822,28 +892,62 @@ class OrganismStage3Tests(unittest.TestCase):
             resp = provider.generate(ModelRequest(system_instruction="sys", prompt="hello", max_output_tokens=64))
             self.assertEqual(resp.model_name, "gemini-3.8-flash")
             self.assertEqual(resp.text, "Verified free-tier output")
+            self.assertEqual(resp.prompt_tokens, 12)
+            self.assertEqual(resp.completion_tokens, 8)
+            self.assertEqual(resp.total_tokens, 20)
             self.assertEqual(
                 captured_urls[0],
                 "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
             )
+            probe_res = provider.probe()
+            self.assertTrue(probe_res["ok"])
+            self.assertEqual(probe_res["http_status"], 200)
+            self.assertEqual(probe_res["usage"]["total_tokens"], 20)
+            self.assertNotIn(fake_key, json.dumps(probe_res))
 
-            # 2. HTTP 404 model not found raises ProviderError without leaking API key
+            # 2. HTTP 401 and 403 authentication/authorization failures (fail fast, no key leakage)
+            for auth_code in (401, 403):
+                attempts_auth = {"n": 0}
+
+                def auth_err_opener(req: Any, timeout: int = 20, code: int = auth_code) -> _FakeHTTPResponse:
+                    attempts_auth["n"] += 1
+                    raise urllib.error.HTTPError(
+                        url=req.full_url,
+                        code=code,
+                        msg="Auth Error",
+                        hdrs=None,  # type: ignore[arg-type]
+                        fp=io.BytesIO(f'{{"error":{{"message":"denied for {fake_key}"}}}}'.encode("utf-8")),
+                    )
+
+                auth_provider = GeminiProvider(
+                    model_name="gemini-3.8-flash",
+                    max_retries=2,
+                    backoff_base_seconds=0.001,
+                    opener=auth_err_opener,
+                )
+                with self.assertRaises(ProviderError) as ctx_auth:
+                    auth_provider.generate(ModelRequest(system_instruction="", prompt="hi"))
+                self.assertEqual(attempts_auth["n"], 1)
+                self.assertIn(str(auth_code), str(ctx_auth.exception))
+                self.assertNotIn(fake_key, str(ctx_auth.exception))
+
+            # 3. HTTP 404 model not found raises ProviderError without leaking API key
             def err_404_opener(req: Any, timeout: int = 20) -> _FakeHTTPResponse:
                 raise urllib.error.HTTPError(
                     url=req.full_url,
                     code=404,
                     msg="Not Found",
                     hdrs=None,  # type: ignore[arg-type]
-                    fp=io.BytesIO(b'{"error":{"message":"model not found for AIzaTestFakeGeminiKey1234567890"}}'),
+                    fp=io.BytesIO(f'{{"error":{{"message":"model not found for {fake_key}"}}}}'.encode("utf-8")),
                 )
 
             bad_provider = GeminiProvider(model_name="gemini-3.8-flash", max_retries=0, opener=err_404_opener)
             with self.assertRaises(ProviderError) as ctx404:
                 bad_provider.generate(ModelRequest(system_instruction="", prompt="hi"))
-            self.assertNotIn("AIzaTestFakeGeminiKey1234567890", str(ctx404.exception))
+            self.assertNotIn(fake_key, str(ctx404.exception))
             self.assertIn("404", str(ctx404.exception))
 
-            # 3. HTTP 429 raises QuotaExhaustedError
+            # 4. HTTP 429 raises QuotaExhaustedError
             def err_429_opener(req: Any, timeout: int = 20) -> _FakeHTTPResponse:
                 raise urllib.error.HTTPError(
                     url=req.full_url,
@@ -854,8 +958,34 @@ class OrganismStage3Tests(unittest.TestCase):
                 )
 
             quota_provider = GeminiProvider(model_name="gemini-3.8-flash", max_retries=0, opener=err_429_opener)
-            with self.assertRaises(QuotaExhaustedError):
+            with self.assertRaises(QuotaExhaustedError) as ctx429:
                 quota_provider.generate(ModelRequest(system_instruction="", prompt="hi"))
+            self.assertIn("429", str(ctx429.exception))
+
+            # 5. HTTP 5xx retries cleanly and raises ProviderError with status code
+            attempts_5xx = {"n": 0}
+
+            def err_503_opener(req: Any, timeout: int = 20) -> _FakeHTTPResponse:
+                attempts_5xx["n"] += 1
+                raise urllib.error.HTTPError(
+                    url=req.full_url,
+                    code=503,
+                    msg="Service Unavailable",
+                    hdrs=None,  # type: ignore[arg-type]
+                    fp=io.BytesIO(f'{{"error":{{"message":"backend overloaded {fake_key}"}}}}'.encode("utf-8")),
+                )
+
+            srv_provider = GeminiProvider(
+                model_name="gemini-3.8-flash",
+                max_retries=1,
+                backoff_base_seconds=0.001,
+                opener=err_503_opener,
+            )
+            with self.assertRaises(ProviderError) as ctx503:
+                srv_provider.generate(ModelRequest(system_instruction="", prompt="hi"))
+            self.assertEqual(attempts_5xx["n"], 2)
+            self.assertIn("503", str(ctx503.exception))
+            self.assertNotIn(fake_key, str(ctx503.exception))
         finally:
             if old_model is None:
                 os.environ.pop("ORGANISM_MODEL_NAME", None)
@@ -866,7 +996,7 @@ class OrganismStage3Tests(unittest.TestCase):
             else:
                 os.environ["GEMINI_API_KEY"] = old_key
 
-    def test_20_workflow_validation_passes_stage3_1_checks(self) -> None:
+    def test_20_workflow_validation_passes_stage3_3_checks(self) -> None:
         from scripts.validate_workflows import validate_workflows
 
         repo_root = Path(__file__).resolve().parents[2]
@@ -875,6 +1005,51 @@ class OrganismStage3Tests(unittest.TestCase):
         self.assertIn("telegram_polling.yml", res["workflows"])
         self.assertIn("organism_cycle.yml", res["workflows"])
         self.assertIn("ci.yml", res["workflows"])
+
+    def test_21_git_auth_extraheader_and_ls_remote_error_classification(self) -> None:
+        import base64
+        import subprocess
+        from scripts.git_state_sync import (
+            GitSyncError,
+            build_git_auth_env,
+            fetch_state_branch,
+            probe_remote_branch,
+        )
+
+        # 1. Transient HTTP extraheader auth never touches remote URL or git config
+        fake_gh_token = "ghs_ExampleTransientActionsToken999"
+        https_remote = "https://github.com/example/ORGANISM.git"
+        env = build_git_auth_env(https_remote, token=fake_gh_token, base_env={})
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "1")
+        self.assertEqual(env["GIT_CONFIG_KEY_0"], "http.https://github.com/.extraheader")
+        expected_b64 = base64.b64encode(f"x-access-token:{fake_gh_token}".encode("utf-8")).decode("ascii")
+        self.assertEqual(env["GIT_CONFIG_VALUE_0"], f"Authorization: Basic {expected_b64}")
+
+        # 2. Local bare repo: missing branch (rc=2) -> exists=False; existing branch (rc=0) -> exists=True
+        bare_repo = Path(self.tmp_dir.name) / "auth_remote.git"
+        subprocess.run(["git", "init", "--bare", str(bare_repo)], check=True, capture_output=True)
+        probe_repo = Path(self.tmp_dir.name) / "probe_repo"
+        probe_repo.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(probe_repo)], check=True)
+
+        absent = probe_remote_branch(probe_repo, str(bare_repo), branch="organism-state")
+        self.assertEqual(absent, {"exists": False, "remote_oid": None})
+
+        # 3. Unreachable/corrupted remote (rc=128) MUST raise GitSyncError, NOT exists=False
+        missing_remote = Path(self.tmp_dir.name) / "does_not_exist.git"
+        with self.assertRaises(GitSyncError):
+            probe_remote_branch(probe_repo, str(missing_remote), branch="organism-state")
+
+        enc_dir = Path(self.tmp_dir.name) / "fail_enc"
+        leg_dir = Path(self.tmp_dir.name) / "fail_leg"
+        with self.assertRaises(GitSyncError):
+            fetch_state_branch(
+                state_repo_dir=probe_repo,
+                remote_url=str(missing_remote),
+                encrypted_dir=enc_dir,
+                legacy_state_dir=leg_dir,
+            )
 
 
 if __name__ == "__main__":

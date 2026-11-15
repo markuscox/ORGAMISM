@@ -6,8 +6,9 @@ import json
 import os
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from organism.kernel.contracts import (
     CycleCheckpoint,
@@ -34,12 +35,26 @@ class SQLiteMemoryStore:
         self._migrate_schema()
         self._ensure_identity()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(str(self.db_path), timeout=10.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    def checkpoint_wal(self) -> None:
+        """Flush and truncate SQLite WAL into the main .db file so direct .db backups stay complete."""
+        conn = sqlite3.connect(str(self.db_path), timeout=10.0)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            conn.commit()
+        finally:
+            conn.close()
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
@@ -1455,6 +1470,7 @@ class SQLiteMemoryStore:
                 """,
                 (int(last_update_id), utc_now_iso()),
             )
+        self.checkpoint_wal()
 
     def is_telegram_update_processed(self, update_id: int) -> bool:
         with self._connect() as conn:
@@ -1479,6 +1495,7 @@ class SQLiteMemoryStore:
                 )
                 """
             )
+        self.checkpoint_wal()
 
     def export_snapshot(self) -> dict[str, Any]:
         payload = {
@@ -1494,6 +1511,7 @@ class SQLiteMemoryStore:
         with tmp_path.open("w", encoding="utf-8") as fh:
             json.dump(signed, fh, indent=2, ensure_ascii=True)
         os.replace(tmp_path, self.snapshot_path)
+        self.checkpoint_wal()
         return signed
 
     def verify_snapshot_file(self) -> bool:

@@ -30,6 +30,24 @@ def validate_workflows(repo_root: Path | None = None) -> dict[str, Any]:
             if not any(line.startswith(key) for line in lines):
                 raise AssertionError(f"{path.name} missing required top-level key '{key}'")
 
+        # Ensure forbidden contexts (`${{ runner.* }}`, `${{ secrets.* }}`) never appear in job-level env:
+        in_job_env = False
+        job_env_indent = 0
+        for idx, line in enumerate(lines, start=1):
+            stripped = line.lstrip(" ")
+            indent = len(line) - len(stripped)
+            if re.match(r"^\s{4}env:\s*$", line):
+                in_job_env = True
+                job_env_indent = indent
+                continue
+            if in_job_env:
+                if stripped and indent <= job_env_indent:
+                    in_job_env = False
+                elif "${{ runner." in line or "${{ secrets." in line:
+                    raise AssertionError(
+                        f"{path.name}:{idx} uses forbidden expression in job-level env: {stripped}"
+                    )
+
         # Ensure zero unescaped ${{ github.event.inputs.* }} or ${{ secrets.* }} inside `run:` shell scripts
         in_run_block = False
         run_indent = 0
@@ -56,13 +74,35 @@ def validate_workflows(repo_root: Path | None = None) -> dict[str, Any]:
 
         results[path.name] = {"lines": len(lines), "valid": True}
 
-    pub_script = root / "scripts" / "publish_encrypted_state.sh"
-    if not pub_script.exists():
-        raise AssertionError(f"Missing publish script: {pub_script}")
+    scripts_dir = root / "scripts"
+    pub_script = scripts_dir / "publish_encrypted_state.sh"
+    fetch_script = scripts_dir / "fetch_state_branch.sh"
+    sync_py = scripts_dir / "git_state_sync.py"
+    for p in (pub_script, fetch_script, sync_py):
+        if not p.exists():
+            raise AssertionError(f"Missing Git sync script: {p}")
+
     pub_text = pub_script.read_text(encoding="utf-8")
-    for req in ("git add -A", "state-verify-git-tree", "organism-state", "assert_no_plaintext_in_publish_dir"):
+    for req in ("git_state_sync.py", "publish", "organism-state", "--expected-state-dir"):
         if req not in pub_text:
-            raise AssertionError(f"publish_encrypted_state.sh missing required safeguard: {req}")
+            raise AssertionError(f"publish_encrypted_state.sh missing required directive: {req}")
+
+    fetch_text = fetch_script.read_text(encoding="utf-8")
+    for req in ("git_state_sync.py", "fetch", "organism-state"):
+        if req not in fetch_text:
+            raise AssertionError(f"fetch_state_branch.sh missing required directive: {req}")
+
+    sync_text = sync_py.read_text(encoding="utf-8")
+    for req in (
+        "GIT_CONFIG_COUNT",
+        "extraheader",
+        "ls-remote",
+        "assert_clean_git_publish_tree",
+        "assert_no_plaintext_in_publish_dir",
+        "verify_bundle_matches_state",
+    ):
+        if req not in sync_text:
+            raise AssertionError(f"git_state_sync.py missing required safeguard: {req}")
 
     tg = (wf_dir / "telegram_polling.yml").read_text(encoding="utf-8")
     for req in (
@@ -70,8 +110,14 @@ def validate_workflows(repo_root: Path | None = None) -> dict[str, Any]:
         "workflow_dispatch:",
         "group: organism-state-persistence",
         "cancel-in-progress: false",
+        "$RUNNER_TEMP",
+        "$GITHUB_ENV",
+        "GH_TOKEN: ${{ github.token }}",
+        "fetch_state_branch.sh",
+        "STATE_BRANCH_EXISTS",
         "state-migrate-restore",
         "state-pack",
+        "state-verify-bundle",
         "publish_encrypted_state.sh",
         "TELEGRAM_BOT_TOKEN",
         "TELEGRAM_OWNER_ID",
@@ -90,8 +136,14 @@ def validate_workflows(repo_root: Path | None = None) -> dict[str, Any]:
         "workflow_dispatch:",
         "group: organism-state-persistence",
         "cancel-in-progress: false",
+        "$RUNNER_TEMP",
+        "$GITHUB_ENV",
+        "GH_TOKEN: ${{ github.token }}",
+        "fetch_state_branch.sh",
+        "STATE_BRANCH_EXISTS",
         "state-migrate-restore",
         "state-pack",
+        "state-verify-bundle",
         "publish_encrypted_state.sh",
         "gemini-3.8-flash",
     ):
@@ -102,7 +154,13 @@ def validate_workflows(repo_root: Path | None = None) -> dict[str, Any]:
     for req in (
         "push:",
         'branches: ["main"]',
+        "workflow-lint:",
+        "python-tests:",
+        "node-build:",
+        "gemini-probe:",
+        'python-version: "3.11"',
         'node-version: "22"',
+        "actionlint",
         "npm ci",
         "npm run lint",
         "npm run build",
