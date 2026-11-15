@@ -14,21 +14,21 @@ It makes **no claim** to consciousness, sentience, or AGI. Stage 3 preserves 100
    - **Idempotency & Recovery**: Persists `telegram_state.last_update_id` and deduplicates `update_id` values in `telegram_processed_updates`. Automatically chunks replies > 4000 characters (`<= 4096` Telegram limit) and retries transient network/429/5xx failures while redacting tokens from any error strings.
    - **Commands**: `/start`, `/help`, `/status`, `/memory <text>`, `/wake <text>`, `/approve <cycle_id>`, `/reject <cycle_id>`. All plain RU/EN text routes directly through `CognitiveKernel.run_cycle(...)`.
 
-2. **Authenticated State Encryption (`organism/safety/state_crypto.py`)**:
+2. **Authenticated State Encryption & Safe Legacy Migration (`organism/safety/state_crypto.py`)**:
    - Encrypts SQLite (using `sqlite3.Connection.backup()` so WAL journals are merged consistently) + `latest_checkpoint.json` into `encrypted_state/organism_state.fernet` using **Fernet (AES-128-CBC + HMAC-SHA256)** via `cryptography.fernet.Fernet` (with an OpenSSL wire-compatible fallback for restricted local sandboxes).
    - Verifies HMAC signature, inner per-file SHA-256 digests, `PRAGMA integrity_check`, and snapshot SHA-256 inside a temporary directory **before** writing to `state/`.
-   - Fails closed (`StateCryptoError` / `InvalidCiphertextError`) on missing/invalid keys or corrupted ciphertext without overwriting existing state. Enforces `assert_no_plaintext_in_publish_dir` so only ciphertext and non-sensitive cipher metadata can exist on the public `organism-state` branch.
+   - Fails closed (`StateCryptoError` / `InvalidCiphertextError`) on missing/invalid keys or corrupted ciphertext without overwriting existing state. `state-migrate-restore` safely migrates legacy plaintext `state/` databases into encrypted bundles if `.fernet` does not exist yet, and `scripts/publish_encrypted_state.sh` removes tracked `state/` files (`git add -A`), audits `git ls-files` and `git log`, and rewrites `organism-state` into an encrypted-only orphan commit when legacy plaintext commits remain.
 
 3. **Multilingual (Russian + English) Cognition & Persistent Dialogue Context**:
    - `organism/memory/retrieval.py` implements Unicode (`unicodedata`) tokenization and lightweight Russian/English stem matching.
    - `organism/organs/perception.py` detects Russian (`ru`) vs English (`en`) script, extracts RU/EN assertions (`факт:`, `запомни:`, `fact:`, `remember:`), hypotheses (`гипотеза:`, `hypothesis:`), math (`посчитай ...`, `calc: ...`), and recall queries.
-   - `organism/organs/reasoning.py` preserves user language, runs `PermissionPolicy.evaluate(trust_level, Capability.CALL_LLM)` immediately before any LLM call, and explicitly separates `[эпизод / не проверено]` dialogue context from `[кандидат]` and `[проверенный факт]`.
+   - `organism/organs/reasoning.py` preserves user language, runs `PermissionPolicy.evaluate(trust_level, Capability.CALL_LLM)` immediately before any LLM call (default free-tier model: `gemini-3.8-flash`, overridable via `ORGANISM_MODEL_NAME`), and explicitly separates `[эпизод / не проверено]` dialogue context from `[кандидат]` and `[проверенный факт]`.
 
 4. **Hardened Web Observatory Backend (`server.ts`) & GitHub Actions Workflows**:
    - All mutating/admin routes (`/api/cycle/wake`, `/api/cycle/resume`, `/api/cycle/approve`, `/api/eval/run`, `/api/experiments/run`, `/api/memory/*`, `/api/continual/replay`, `/api/state/reset`, `/api/admin/state`) require `Authorization: Bearer <ORGANISM_ADMIN_TOKEN>` (validated with `crypto.timingSafeEqual`).
    - Inline `approved: true` on `/api/cycle/wake` and `/api/cycle/resume` is rejected (`400`); approvals require an explicit single `cycleId` via `/api/cycle/approve`.
    - Unauthenticated `GET /api/state` exposes aggregate telemetry only (`redacted_private_state: true`) with empty user memory/episode/checkpoint lists.
-   - `.github/workflows/telegram_polling.yml` runs every 5 minutes (plus manual dispatch) using concurrency group `organism-state-persistence`, environment-variable argument passing (zero shell interpolation of user input), and zero unencrypted database/message artifacts.
+   - `.github/workflows/telegram_polling.yml` runs every 5 minutes (plus `workflow_dispatch`) using concurrency group `organism-state-persistence`, isolated `$RUNNER_TEMP/state_repo` branch operations, environment-variable argument passing (zero shell interpolation of user input), and zero unencrypted database/message artifacts. `.github/workflows/ci.yml` runs Python tests, benchmarks, workflow validation, and Node.js 22 `npm ci` + `npm run lint` + `npm run build` backed by `package-lock.json`.
 
 ---
 
@@ -48,12 +48,15 @@ In your GitHub repository (**Settings → Secrets and variables → Actions**), 
 - `TELEGRAM_BOT_TOKEN` — token from `@BotFather` (already created if following Stage 3 setup)
 - `TELEGRAM_OWNER_ID` — your numeric private Telegram user ID (already created if following Stage 3 setup)
 - `ORGANISM_STATE_ENCRYPTION_KEY` — the Fernet key generated via `python3 main.py keygen`
-- `GEMINI_API_KEY` — optional Gemini API key for natural-language synthesis beyond deterministic reasoning
-- *(Local / Server only)* `ORGANISM_ADMIN_TOKEN` — strong random bearer secret to unlock the Observatory control UI
+- `GEMINI_API_KEY` — optional Gemini API key (`gemini-3.8-flash` default; override with `ORGANISM_MODEL_NAME`)
+- *(Server / local UI only; not passed to Telegram polling)* `ORGANISM_ADMIN_TOKEN` — strong random bearer secret to unlock the Observatory control UI
 
 ### 3. Verify Locally & Run Tests
 
 ```bash
+# Validate GitHub Actions workflows
+python3 scripts/validate_workflows.py
+
 # Run Stage 1 + Stage 2 + Stage 3 test suite
 python3 -m unittest discover -s organism/tests -v
 
@@ -63,9 +66,10 @@ python3 main.py eval
 # Test encrypted state pack / unpack cycle
 ORGANISM_STATE_ENCRYPTION_KEY="$(python3 main.py keygen)" python3 main.py state-pack --verify-no-plaintext
 
-# Build & run Web Observatory (Port 3000)
-npm install
-ORGANISM_ADMIN_TOKEN="replace-with-strong-random-token" npm run dev
+# Clean CI install, TypeScript check, & build on Node 22
+npm ci
+npm run lint
+npm run build
 ```
 
 ---

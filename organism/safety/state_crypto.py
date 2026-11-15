@@ -288,39 +288,147 @@ class StateEncryptor:
             for fname, fbytes in decoded_files.items():
                 (verify_path / fname).write_bytes(fbytes)
 
-            for db_file in verify_path.glob("*.db"):
-                conn = sqlite3.connect(str(db_file), timeout=10.0)
-                try:
-                    row = conn.execute("PRAGMA integrity_check;").fetchone()
-                    if not row or str(row[0]).lower() != "ok":
-                        raise InvalidCiphertextError(f"SQLite integrity check failed for {db_file.name}.")
-                finally:
-                    conn.close()
-
-            snap_file = verify_path / "latest_checkpoint.json"
-            if snap_file.exists():
-                snap_data = json.loads(snap_file.read_text(encoding="utf-8"))
-                if not IntegrityValidator.verify_snapshot(snap_data):
-                    raise InvalidCiphertextError("Snapshot SHA-256 verification failed after decryption.")
+            verify_plaintext_state_dir(verify_path)
 
         # Atomically populate target state_dir
-        state_dir.mkdir(parents=True, exist_ok=True)
-        for leftover in list(state_dir.iterdir()):
-            if leftover.is_file() and (
-                leftover.name in decoded_files or leftover.name.endswith((".db-wal", ".db-shm"))
-            ):
-                leftover.unlink()
-        for fname, fbytes in decoded_files.items():
-            target = state_dir / fname
-            tmp_target = target.with_suffix(target.suffix + ".tmp")
-            tmp_target.write_bytes(fbytes)
-            os.replace(tmp_target, target)
+        _atomic_populate_state_dir(decoded_files, state_dir)
 
         return {
             "restored_files": sorted(decoded_files.keys()),
             "file_count": len(decoded_files),
             "backend": self.backend_name,
         }
+
+    def migrate_or_restore(
+        self,
+        state_dir: Path,
+        encrypted_dir: Path,
+        legacy_state_dir: Path | None = None,
+        allow_empty: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Safely restore encrypted state or migrate legacy plaintext `state/` into an encrypted bundle:
+          1. If encrypted bundle exists -> decrypt, verify DB/snapshot integrity, restore (never overwrite with empty).
+          2. Else if legacy plaintext DB exists -> verify integrity BEFORE & AFTER WAL-safe copy, populate state_dir,
+             and create encrypted bundle immediately.
+          3. Else if state_dir already has DB -> verify integrity & preserve existing state.
+          4. Else -> initialize empty only when allow_empty=True; otherwise fail closed.
+        """
+        state_dir = Path(state_dir)
+        encrypted_dir = Path(encrypted_dir)
+        bundle_path = encrypted_dir / self.BUNDLE_FILENAME
+
+        if bundle_path.exists():
+            restored = self.unpack_state_dir(encrypted_dir, state_dir)
+            return {"mode": "restored_encrypted", **restored}
+
+        legacy_dir = Path(legacy_state_dir) if legacy_state_dir else None
+        legacy_dbs = sorted(legacy_dir.glob("*.db")) if legacy_dir and legacy_dir.exists() else []
+
+        if legacy_dir is not None and legacy_dbs:
+            # Verify legacy SQLite & snapshot BEFORE migration
+            verify_plaintext_state_dir(legacy_dir)
+
+            migrated_files: dict[str, bytes] = {}
+            for db_file in legacy_dbs:
+                migrated_files[db_file.name] = self._safe_sqlite_backup_bytes(db_file)
+
+            for item in sorted(legacy_dir.iterdir()):
+                if not item.is_file():
+                    continue
+                if item.name.endswith((".db", ".db-wal", ".db-shm", ".tmp")):
+                    continue
+                migrated_files[item.name] = item.read_bytes()
+
+            # Verify copied bytes in staging temp directory BEFORE modifying target state_dir
+            with tempfile.TemporaryDirectory() as verify_tmp:
+                verify_path = Path(verify_tmp)
+                for fname, fbytes in migrated_files.items():
+                    (verify_path / fname).write_bytes(fbytes)
+                verify_plaintext_state_dir(verify_path)
+
+            _atomic_populate_state_dir(migrated_files, state_dir)
+            verify_plaintext_state_dir(state_dir)
+
+            pack_meta = self.pack_state_dir(state_dir, encrypted_dir)
+            return {
+                "mode": "migrated_legacy_plaintext",
+                "migrated_files": sorted(migrated_files.keys()),
+                "file_count": len(migrated_files),
+                "pack_meta": pack_meta,
+            }
+
+        existing_dbs = sorted(state_dir.glob("*.db")) if state_dir.exists() else []
+        if existing_dbs:
+            verify_plaintext_state_dir(state_dir)
+            return {
+                "mode": "preserved_existing_local",
+                "files": [p.name for p in existing_dbs],
+            }
+
+        if allow_empty:
+            state_dir.mkdir(parents=True, exist_ok=True)
+            return {"mode": "initialized_empty", "file_count": 0}
+
+        raise StateCryptoError(
+            f"Neither encrypted bundle ({bundle_path}) nor legacy state DB exists; fail closed without resetting memory."
+        )
+
+
+def _atomic_populate_state_dir(decoded_files: dict[str, bytes], state_dir: Path) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    for leftover in list(state_dir.iterdir()):
+        if leftover.is_file() and (
+            leftover.name in decoded_files or leftover.name.endswith((".db-wal", ".db-shm"))
+        ):
+            leftover.unlink()
+    for fname, fbytes in decoded_files.items():
+        target = state_dir / fname
+        tmp_target = target.with_suffix(target.suffix + ".tmp")
+        tmp_target.write_bytes(fbytes)
+        os.replace(tmp_target, target)
+
+
+def verify_sqlite_integrity(db_path: Path) -> None:
+    db_path = Path(db_path)
+    if not db_path.exists() or db_path.stat().st_size == 0:
+        raise InvalidCiphertextError(f"SQLite file missing or empty: {db_path.name}")
+    conn = sqlite3.connect(str(db_path), timeout=10.0)
+    try:
+        row = conn.execute("PRAGMA integrity_check;").fetchone()
+        if not row or str(row[0]).lower() != "ok":
+            raise InvalidCiphertextError(f"SQLite integrity check failed for {db_path.name}.")
+    except sqlite3.Error as exc:
+        raise InvalidCiphertextError(f"SQLite unreadable or corrupted ({db_path.name}): {exc}") from exc
+    finally:
+        conn.close()
+
+
+def verify_plaintext_state_dir(state_dir: Path) -> dict[str, Any]:
+    """Verify every SQLite DB passes PRAGMA integrity_check and latest_checkpoint.json passes SHA-256 verification."""
+    state_dir = Path(state_dir)
+    if not state_dir.exists():
+        raise StateCryptoError(f"State directory does not exist: {state_dir}")
+
+    db_files = sorted(state_dir.glob("*.db"))
+    for db_file in db_files:
+        verify_sqlite_integrity(db_file)
+
+    snap_file = state_dir / "latest_checkpoint.json"
+    snap_verified = False
+    if snap_file.exists():
+        try:
+            snap_data = json.loads(snap_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise InvalidCiphertextError(f"Corrupted snapshot JSON ({snap_file.name}): {exc}") from exc
+        if not IntegrityValidator.verify_snapshot(snap_data):
+            raise InvalidCiphertextError("Snapshot SHA-256 verification failed.")
+        snap_verified = True
+
+    return {
+        "db_files": [p.name for p in db_files],
+        "snapshot_verified": snap_verified,
+    }
 
 
 def assert_no_plaintext_in_publish_dir(publish_dir: Path) -> None:
@@ -346,3 +454,67 @@ def assert_no_plaintext_in_publish_dir(publish_dir: Path) -> None:
         extra = set(meta.keys()) - allowed_keys
         if extra:
             raise StateCryptoError(f"Unexpected metadata keys in publish directory: {sorted(extra)}")
+
+
+def assert_clean_git_publish_tree(repo_dir: Path, check_history: bool = True) -> dict[str, Any]:
+    """
+    Verify that a checked-out `organism-state` repository contains ONLY encrypted artifacts
+    in both its tracked Git index (`git ls-files`) and (optionally) full branch commit history (`git log`).
+    """
+    repo_dir = Path(repo_dir)
+    allowed_git_paths = {
+        f"encrypted_state/{StateEncryptor.BUNDLE_FILENAME}",
+        f"encrypted_state/{StateEncryptor.META_FILENAME}",
+    }
+
+    ls_proc = subprocess.run(
+        ["git", "ls-files"],
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    tracked = [line.strip() for line in ls_proc.stdout.splitlines() if line.strip()]
+    unexpected_tracked = [p for p in tracked if p not in allowed_git_paths]
+    if unexpected_tracked:
+        raise StateCryptoError(
+            f"Prohibited plaintext or unexpected files tracked in state branch tip: {unexpected_tracked}"
+        )
+
+    # Also verify working tree contains no untracked plaintext state/ or *.db / *.json outside metadata.json
+    for item in repo_dir.rglob("*"):
+        if item.is_dir() or ".git" in item.parts:
+            continue
+        rel = item.relative_to(repo_dir).as_posix()
+        if rel not in allowed_git_paths:
+            raise StateCryptoError(
+                f"Prohibited file present in state branch working tree: {rel}"
+            )
+
+    enc_sub = repo_dir / "encrypted_state"
+    if enc_sub.exists():
+        assert_no_plaintext_in_publish_dir(enc_sub)
+
+    history_checked = False
+    if check_history:
+        log_proc = subprocess.run(
+            ["git", "log", "HEAD", "--name-only", "--pretty=format:"],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if log_proc.returncode == 0:
+            history_checked = True
+            hist_files = {line.strip() for line in log_proc.stdout.splitlines() if line.strip()}
+            leaked_hist = sorted(p for p in hist_files if p not in allowed_git_paths)
+            if leaked_hist:
+                raise StateCryptoError(
+                    f"Plaintext or non-encrypted files remain in branch history: {leaked_hist}"
+                )
+
+    return {
+        "tracked_files": tracked,
+        "history_checked": history_checked,
+        "clean": True,
+    }

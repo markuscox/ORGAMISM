@@ -7,14 +7,22 @@ on:
         description: "Incoming stimulus text for this wake cycle"
         required: false
         default: "calc: 21 * 2"
+        type: string
       event_source:
         description: "Source identifier"
         required: false
         default: "github_actions_dispatch"
+        type: string
       mode:
         description: "Reasoning mode (auto | deterministic_only | gemini_assisted)"
         required: false
         default: "auto"
+        type: string
+      purge_plaintext_history:
+        description: "Force rewrite ONLY organism-state branch history after encrypting active state"
+        required: false
+        default: false
+        type: boolean
   schedule:
     # Conservative 6-hour discrete wake cycle
     - cron: "0 */6 * * *"
@@ -32,6 +40,9 @@ jobs:
     env:
       ORGANISM_STATE_DIR: ${{ runner.temp }}/organism_state
       ENCRYPTED_DIR: ${{ runner.temp }}/encrypted_state
+      LEGACY_STATE_DIR: ${{ runner.temp }}/legacy_state
+      STATE_REPO_DIR: ${{ runner.temp }}/state_repo
+      ORGANISM_MODEL_NAME: gemini-3.8-flash
     steps:
       - name: Checkout code branch
         uses: actions/checkout@v4
@@ -44,25 +55,31 @@ jobs:
       - name: Install Python dependencies
         run: python3 -m pip install -r requirements.txt
 
-      - name: Restore encrypted state from organism-state branch
+      - name: Fetch organism-state branch into isolated directory
         run: |
-          mkdir -p "$ENCRYPTED_DIR" "$ORGANISM_STATE_DIR"
-          git config user.name "organism-runner[bot]"
-          git config user.email "organism-runner[bot]@users.noreply.github.com"
-          if git ls-remote --exit-code --heads origin organism-state >/dev/null 2>&1; then
-            git fetch origin organism-state
-            git checkout -B organism-state-tmp origin/organism-state
-            if [ -d encrypted_state ]; then
-              cp -r encrypted_state/. "$ENCRYPTED_DIR"/
+          mkdir -p "$ORGANISM_STATE_DIR" "$ENCRYPTED_DIR" "$LEGACY_STATE_DIR" "$STATE_REPO_DIR"
+          REMOTE_URL="$(git remote get-url origin)"
+          git init -q "$STATE_REPO_DIR"
+          git -C "$STATE_REPO_DIR" remote add origin "$REMOTE_URL"
+          if git -C "$STATE_REPO_DIR" ls-remote --exit-code --heads origin organism-state >/dev/null 2>&1; then
+            git -C "$STATE_REPO_DIR" fetch origin organism-state
+            git -C "$STATE_REPO_DIR" checkout -B organism-state FETCH_HEAD
+            if [ -d "$STATE_REPO_DIR/encrypted_state" ]; then
+              cp -r "$STATE_REPO_DIR/encrypted_state"/. "$ENCRYPTED_DIR"/
             fi
-            git checkout "${{ github.ref_name }}"
+            if [ -d "$STATE_REPO_DIR/state" ]; then
+              cp -r "$STATE_REPO_DIR/state"/. "$LEGACY_STATE_DIR"/
+            fi
           fi
 
-      - name: Decrypt and verify state integrity (fail-closed)
+      - name: Restore encrypted state or safely migrate legacy plaintext state (fail-closed)
         env:
           ORGANISM_STATE_ENCRYPTION_KEY: ${{ secrets.ORGANISM_STATE_ENCRYPTION_KEY }}
         run: |
-          python3 main.py --state-dir "$ORGANISM_STATE_DIR" state-unpack --encrypted-dir "$ENCRYPTED_DIR" --allow-empty
+          python3 main.py --state-dir "$ORGANISM_STATE_DIR" state-migrate-restore \
+            --encrypted-dir "$ENCRYPTED_DIR" \
+            --legacy-state-dir "$LEGACY_STATE_DIR" \
+            --allow-empty
 
       - name: Run automated Stage 1-3 verification tests
         run: |
@@ -91,25 +108,19 @@ jobs:
         env:
           ORGANISM_STATE_ENCRYPTION_KEY: ${{ secrets.ORGANISM_STATE_ENCRYPTION_KEY }}
         run: |
-          python3 main.py --state-dir "$ORGANISM_STATE_DIR" state-pack --encrypted-dir "$ENCRYPTED_DIR" --verify-no-plaintext
+          python3 main.py --state-dir "$ORGANISM_STATE_DIR" state-pack \
+            --encrypted-dir "$ENCRYPTED_DIR" \
+            --verify-no-plaintext
 
-      - name: Persist encrypted-only state to organism-state branch
+      - name: Publish encrypted-only state to organism-state branch and audit history
+        env:
+          WORKSPACE_DIR: ${{ github.workspace }}
+          COMMIT_MESSAGE: "chore(state): persist encrypted wake cycle ${{ github.run_id }}"
+          PURGE_PLAINTEXT_HISTORY: ${{ github.event.inputs.purge_plaintext_history || 'false' }}
         run: |
-          if git ls-remote --exit-code --heads origin organism-state >/dev/null 2>&1; then
-            git fetch origin organism-state
-            git checkout -B organism-state origin/organism-state
-          else
-            git checkout --orphan organism-state
-            git rm -rf . >/dev/null 2>&1 || true
-          fi
-          rm -rf state encrypted_state
-          mkdir -p encrypted_state
-          cp -r "$ENCRYPTED_DIR"/. encrypted_state/
-          rm -rf "$ORGANISM_STATE_DIR" "$ENCRYPTED_DIR"
-          git add -A encrypted_state/
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(state): persist encrypted wake cycle ${{ github.run_id }}"
-            git push origin organism-state
-          else
-            echo "No state changes to commit."
-          fi
+          PYTHONPATH="${WORKSPACE_DIR}" bash scripts/publish_encrypted_state.sh
+
+      - name: Cleanup temporary plaintext state directories
+        if: always()
+        run: |
+          rm -rf "$ORGANISM_STATE_DIR" "$ENCRYPTED_DIR" "$LEGACY_STATE_DIR" "$STATE_REPO_DIR"

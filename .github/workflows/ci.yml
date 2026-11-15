@@ -21,19 +21,22 @@ jobs:
       - name: Install Python dependencies
         run: python3 -m pip install -r requirements.txt
 
+      - name: Validate GitHub Actions workflows
+        run: python3 scripts/validate_workflows.py
+
       - name: Run Python unit tests (Stage 1 + Stage 2 + Stage 3)
         run: python3 -m unittest discover -s organism/tests -v
 
       - name: Run deterministic capability benchmarks
         run: python3 main.py --state-dir "${{ runner.temp }}/ci_eval_state" eval
 
-      - name: Set up Node.js 20
+      - name: Set up Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
 
-      - name: Install Node dependencies
+      - name: Install Node dependencies cleanly
         run: npm ci
 
       - name: TypeScript type-check

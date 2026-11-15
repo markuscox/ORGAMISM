@@ -72,10 +72,9 @@ def load_config(
         raw, "storage", "snapshot_filename", default="latest_checkpoint.json"
     )
 
-    model_name = os.environ.get(
-        "ORGANISM_MODEL_NAME",
-        _deep_get(raw, "model", "model_name", default="gemini-4-hydrogen"),
-    )
+    default_model_name = _deep_get(raw, "model", "model_name", default="gemini-3.8-flash")
+    env_model_name = os.environ.get("ORGANISM_MODEL_NAME", "").strip()
+    model_name = env_model_name or default_model_name
     daily_token_limit = int(
         os.environ.get(
             "ORGANISM_DAILY_TOKEN_LIMIT",

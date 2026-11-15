@@ -5,7 +5,7 @@
   },
   "model": {
     "provider": "gemini",
-    "model_name": "gemini-4-hydrogen",
+    "model_name": "gemini-3.8-flash",
     "timeout_seconds": 20,
     "max_retries": 2,
     "backoff_base_seconds": 1.0

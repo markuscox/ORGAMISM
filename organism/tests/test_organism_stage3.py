@@ -634,6 +634,248 @@ class OrganismStage3Tests(unittest.TestCase):
         self.assertIn("Секция 1:", joined)
         self.assertIn("Секция 14:", joined)
 
+    def test_17_legacy_state_migration_preserves_data_verifies_integrity_and_encrypts(self) -> None:
+        # 1. Create a legacy plaintext `state/` directory with a fact, episode, and Telegram offset
+        legacy_dir = Path(self.tmp_dir.name) / "legacy_state"
+        legacy_kernel = CognitiveKernel(config=load_config(state_dir_override=legacy_dir))
+        legacy_kernel.run_cycle(
+            CognitiveEvent(
+                event_id="ev_leg_1",
+                operation_id="op_leg_1",
+                source="legacy_op",
+                trust_level=TrustLevel.TRUSTED_OPERATOR,
+                event_type="assertion",
+                content="запомни: мигрированный факт это сохранённое знание",
+            )
+        )
+        legacy_kernel.store.save_telegram_offset(915)
+        legacy_kernel.store.export_snapshot()
+
+        # 2. Migrate into clean runtime state_dir + encrypted_dir (no .fernet existed beforehand)
+        key = generate_fernet_key()
+        encryptor = StateEncryptor(key=key)
+        runtime_dir = Path(self.tmp_dir.name) / "migrated_runtime"
+        enc_dir = Path(self.tmp_dir.name) / "migrated_enc"
+
+        res = encryptor.migrate_or_restore(
+            state_dir=runtime_dir,
+            encrypted_dir=enc_dir,
+            legacy_state_dir=legacy_dir,
+            allow_empty=False,
+        )
+        self.assertEqual(res["mode"], "migrated_legacy_plaintext")
+        assert_no_plaintext_in_publish_dir(enc_dir)
+
+        restored = CognitiveKernel(config=load_config(state_dir_override=runtime_dir))
+        self.assertEqual(restored.store.get_telegram_offset(), 915)
+        self.assertIsNotNone(restored.store.find_semantic_triple("мигрированный факт", "is", "сохранённое знание"))
+
+        # 3. Subsequent run MUST restore from encrypted bundle (and never reset memory)
+        runtime_dir_2 = Path(self.tmp_dir.name) / "migrated_runtime_2"
+        res2 = encryptor.migrate_or_restore(
+            state_dir=runtime_dir_2,
+            encrypted_dir=enc_dir,
+            legacy_state_dir=None,
+            allow_empty=True,
+        )
+        self.assertEqual(res2["mode"], "restored_encrypted")
+        restored_2 = CognitiveKernel(config=load_config(state_dir_override=runtime_dir_2))
+        self.assertEqual(restored_2.store.get_telegram_offset(), 915)
+
+        # 4. Corrupted legacy DB fails closed before migrating
+        bad_legacy = Path(self.tmp_dir.name) / "bad_legacy"
+        bad_legacy.mkdir(parents=True, exist_ok=True)
+        (bad_legacy / "organism_state.db").write_bytes(b"corrupt sqlite bytes")
+        with self.assertRaises(InvalidCiphertextError):
+            encryptor.migrate_or_restore(
+                state_dir=runtime_dir_2,
+                encrypted_dir=Path(self.tmp_dir.name) / "bad_enc_out",
+                legacy_state_dir=bad_legacy,
+                allow_empty=True,
+            )
+        # Existing memory in runtime_dir_2 was not reset or overwritten
+        self.assertEqual(CognitiveKernel(config=load_config(state_dir_override=runtime_dir_2)).store.get_telegram_offset(), 915)
+
+    def test_18_git_publish_script_removes_legacy_state_and_purges_history(self) -> None:
+        import subprocess
+        from organism.safety.state_crypto import assert_clean_git_publish_tree
+
+        bare_repo = Path(self.tmp_dir.name) / "remote.git"
+        work_seed = Path(self.tmp_dir.name) / "seed"
+        subprocess.run(["git", "init", "--bare", str(bare_repo)], check=True, capture_output=True)
+        subprocess.run(["git", "clone", str(bare_repo), str(work_seed)], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Tester"], cwd=str(work_seed), check=True)
+        subprocess.run(["git", "config", "user.email", "tester@example.com"], cwd=str(work_seed), check=True)
+
+        # Seed `main` branch with clean code commit (must stay untouched)
+        subprocess.run(["git", "checkout", "-b", "main"], cwd=str(work_seed), check=True, capture_output=True)
+        (work_seed / "README.md").write_text("main branch", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=str(work_seed), check=True)
+        subprocess.run(["git", "commit", "-m", "init main"], cwd=str(work_seed), check=True, capture_output=True)
+        subprocess.run(["git", "push", "origin", "main"], cwd=str(work_seed), check=True, capture_output=True)
+        main_sha = subprocess.check_output(["git", "rev-parse", "main"], cwd=str(work_seed), text=True).strip()
+
+        # Seed dirty `organism-state` branch containing plaintext state/organism_state.db + latest_checkpoint.json
+        subprocess.run(["git", "checkout", "--orphan", "organism-state"], cwd=str(work_seed), check=True, capture_output=True)
+        subprocess.run(["git", "rm", "-rf", "."], cwd=str(work_seed), check=True, capture_output=True)
+        legacy_state_sub = work_seed / "state"
+        k = CognitiveKernel(config=load_config(state_dir_override=legacy_state_sub))
+        k.run_cycle(
+            CognitiveEvent(
+                event_id="ev_git_1",
+                operation_id="op_git_1",
+                source="owner",
+                trust_level=TrustLevel.TRUSTED_OPERATOR,
+                event_type="assertion",
+                content="fact: git_migration is preserved",
+            )
+        )
+        k.store.save_telegram_offset(424)
+        k.store.export_snapshot()
+        subprocess.run(["git", "add", "-f", "state/organism_state.db", "state/latest_checkpoint.json"], cwd=str(work_seed), check=True)
+        subprocess.run(["git", "commit", "-m", "legacy plaintext state leak"], cwd=str(work_seed), check=True, capture_output=True)
+        subprocess.run(["git", "push", "origin", "organism-state"], cwd=str(work_seed), check=True, capture_output=True)
+
+        # Isolated workflow-style restore -> migrate -> encrypt -> publish_encrypted_state.sh
+        state_repo_dir = Path(self.tmp_dir.name) / "state_repo"
+        runtime_dir = Path(self.tmp_dir.name) / "wf_runtime"
+        enc_dir = Path(self.tmp_dir.name) / "wf_enc"
+        legacy_copy = Path(self.tmp_dir.name) / "wf_legacy"
+        enc_dir.mkdir(parents=True)
+        legacy_copy.mkdir(parents=True)
+
+        subprocess.run(["git", "init", "-q", str(state_repo_dir)], check=True)
+        subprocess.run(["git", "remote", "add", "origin", str(bare_repo)], cwd=str(state_repo_dir), check=True)
+        subprocess.run(["git", "fetch", "origin", "organism-state"], cwd=str(state_repo_dir), check=True, capture_output=True)
+        subprocess.run(["git", "checkout", "-B", "organism-state", "FETCH_HEAD"], cwd=str(state_repo_dir), check=True, capture_output=True)
+        for item in (state_repo_dir / "state").iterdir():
+            (legacy_copy / item.name).write_bytes(item.read_bytes())
+
+        key = generate_fernet_key()
+        encryptor = StateEncryptor(key=key)
+        mig = encryptor.migrate_or_restore(runtime_dir, enc_dir, legacy_state_dir=legacy_copy, allow_empty=False)
+        self.assertEqual(mig["mode"], "migrated_legacy_plaintext")
+
+        repo_root = Path(__file__).resolve().parents[2]
+        env = {
+            **os.environ,
+            "WORKSPACE_DIR": str(repo_root),
+            "PYTHONPATH": str(repo_root),
+            "STATE_REPO_DIR": str(state_repo_dir),
+            "ENCRYPTED_DIR": str(enc_dir),
+            "COMMIT_MESSAGE": "chore(state): encrypted migration test",
+            "PURGE_PLAINTEXT_HISTORY": "false",
+        }
+        proc = subprocess.run(
+            ["bash", str(repo_root / "scripts" / "publish_encrypted_state.sh")],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, f"publish script failed: {proc.stdout}\n{proc.stderr}")
+
+        # Verify remote `organism-state` in a brand-new clone has ONLY encrypted files in tip AND full history
+        verify_clone = Path(self.tmp_dir.name) / "verify_clone"
+        subprocess.run(["git", "clone", "--branch", "organism-state", "--single-branch", str(bare_repo), str(verify_clone)], check=True, capture_output=True)
+        audit = assert_clean_git_publish_tree(verify_clone, check_history=True)
+        self.assertTrue(audit["clean"])
+        self.assertTrue(audit["history_checked"])
+
+        # Verify `main` branch was untouched
+        after_main_sha = subprocess.check_output(["git", "rev-parse", "refs/heads/main"], cwd=str(bare_repo), text=True).strip()
+        self.assertEqual(after_main_sha, main_sha)
+
+        # Verify data restores accurately from the published encrypted branch after restart
+        rehydrated = Path(self.tmp_dir.name) / "rehydrated"
+        encryptor.migrate_or_restore(rehydrated, verify_clone / "encrypted_state", allow_empty=False)
+        k_re = CognitiveKernel(config=load_config(state_dir_override=rehydrated))
+        self.assertEqual(k_re.store.get_telegram_offset(), 424)
+        self.assertIsNotNone(k_re.store.find_semantic_triple("git_migration", "is", "preserved"))
+
+    def test_19_gemini_provider_uses_gemini_3_8_flash_supports_override_and_handles_errors(self) -> None:
+        from organism.models.gemini import GeminiProvider
+        from organism.models.provider import ModelRequest, ProviderError, QuotaExhaustedError
+
+        # 1. Verify default model_name is gemini-3.8-flash and ORGANISM_MODEL_NAME overrides it cleanly
+        old_model = os.environ.get("ORGANISM_MODEL_NAME")
+        old_key = os.environ.get("GEMINI_API_KEY")
+        try:
+            os.environ.pop("ORGANISM_MODEL_NAME", None)
+            self.assertEqual(load_config(state_dir_override=self.state_dir).model_name, "gemini-3.8-flash")
+            os.environ["ORGANISM_MODEL_NAME"] = "gemini-3.8-flash-custom"
+            self.assertEqual(load_config(state_dir_override=self.state_dir).model_name, "gemini-3.8-flash-custom")
+
+            os.environ["GEMINI_API_KEY"] = "AIzaTestFakeGeminiKey1234567890"
+            captured_urls: list[str] = []
+
+            def ok_opener(req: Any, timeout: int = 20) -> _FakeHTTPResponse:
+                captured_urls.append(req.full_url)
+                return _FakeHTTPResponse(
+                    {
+                        "candidates": [{"content": {"parts": [{"text": "Verified free-tier output"}]}, "finishReason": "STOP"}],
+                        "usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 8, "totalTokenCount": 20},
+                    }
+                )
+
+            provider = GeminiProvider(model_name="gemini-3.8-flash", max_retries=0, opener=ok_opener)
+            resp = provider.generate(ModelRequest(system_instruction="sys", prompt="hello", max_output_tokens=64))
+            self.assertEqual(resp.model_name, "gemini-3.8-flash")
+            self.assertEqual(resp.text, "Verified free-tier output")
+            self.assertEqual(
+                captured_urls[0],
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
+            )
+
+            # 2. HTTP 404 model not found raises ProviderError without leaking API key
+            def err_404_opener(req: Any, timeout: int = 20) -> _FakeHTTPResponse:
+                raise urllib.error.HTTPError(
+                    url=req.full_url,
+                    code=404,
+                    msg="Not Found",
+                    hdrs=None,  # type: ignore[arg-type]
+                    fp=io.BytesIO(b'{"error":{"message":"model not found for AIzaTestFakeGeminiKey1234567890"}}'),
+                )
+
+            bad_provider = GeminiProvider(model_name="gemini-3.8-flash", max_retries=0, opener=err_404_opener)
+            with self.assertRaises(ProviderError) as ctx404:
+                bad_provider.generate(ModelRequest(system_instruction="", prompt="hi"))
+            self.assertNotIn("AIzaTestFakeGeminiKey1234567890", str(ctx404.exception))
+            self.assertIn("404", str(ctx404.exception))
+
+            # 3. HTTP 429 raises QuotaExhaustedError
+            def err_429_opener(req: Any, timeout: int = 20) -> _FakeHTTPResponse:
+                raise urllib.error.HTTPError(
+                    url=req.full_url,
+                    code=429,
+                    msg="Too Many Requests",
+                    hdrs=None,  # type: ignore[arg-type]
+                    fp=io.BytesIO(b'{"error":{"message":"RESOURCE_EXHAUSTED"}}'),
+                )
+
+            quota_provider = GeminiProvider(model_name="gemini-3.8-flash", max_retries=0, opener=err_429_opener)
+            with self.assertRaises(QuotaExhaustedError):
+                quota_provider.generate(ModelRequest(system_instruction="", prompt="hi"))
+        finally:
+            if old_model is None:
+                os.environ.pop("ORGANISM_MODEL_NAME", None)
+            else:
+                os.environ["ORGANISM_MODEL_NAME"] = old_model
+            if old_key is None:
+                os.environ.pop("GEMINI_API_KEY", None)
+            else:
+                os.environ["GEMINI_API_KEY"] = old_key
+
+    def test_20_workflow_validation_passes_stage3_1_checks(self) -> None:
+        from scripts.validate_workflows import validate_workflows
+
+        repo_root = Path(__file__).resolve().parents[2]
+        res = validate_workflows(repo_root=repo_root)
+        self.assertEqual(res["status"], "ok")
+        self.assertIn("telegram_polling.yml", res["workflows"])
+        self.assertIn("organism_cycle.yml", res["workflows"])
+        self.assertIn("ci.yml", res["workflows"])
+
 
 if __name__ == "__main__":
     unittest.main()

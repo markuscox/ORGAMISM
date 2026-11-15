@@ -16,6 +16,7 @@ from organism.kernel.runtime import CognitiveKernel
 from organism.safety.state_crypto import (
     StateCryptoError,
     StateEncryptor,
+    assert_clean_git_publish_tree,
     assert_no_plaintext_in_publish_dir,
     generate_fernet_key,
 )
@@ -77,6 +78,21 @@ def build_parser() -> argparse.ArgumentParser:
     unpack.add_argument("--encrypted-dir", default="encrypted_state", help="Input directory containing encrypted bundle")
     unpack.add_argument("--allow-empty", action="store_true", help="Allow initialization if bundle does not exist yet")
 
+    migrate = sub.add_parser(
+        "state-migrate-restore",
+        help="Restore encrypted bundle or safely migrate verified legacy state/ into encrypted bundle",
+    )
+    migrate.add_argument("--encrypted-dir", default="encrypted_state", help="Directory containing encrypted bundle")
+    migrate.add_argument("--legacy-state-dir", default=None, help="Legacy plaintext state directory to migrate if no bundle exists")
+    migrate.add_argument("--allow-empty", action="store_true", help="Allow initialization if neither bundle nor legacy DB exists")
+
+    verify_git = sub.add_parser(
+        "state-verify-git-tree",
+        help="Assert checked-out state repository contains ONLY encrypted artifacts in tip and history",
+    )
+    verify_git.add_argument("--repo-dir", required=True, help="Checked-out organism-state repository directory")
+    verify_git.add_argument("--check-history", action="store_true", help="Also verify full commit history contains zero plaintext")
+
     tg = sub.add_parser("telegram-poll", help="Poll Telegram Bot API once and process verified owner updates")
     tg.add_argument("--limit", type=int, default=25, help="Maximum updates to fetch")
     tg.add_argument("--timeout", type=int, default=5, help="Telegram long-poll timeout in seconds")
@@ -92,6 +108,33 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "keygen":
         print(generate_fernet_key())
         return 0
+
+    if args.command == "state-verify-git-tree":
+        try:
+            res = assert_clean_git_publish_tree(
+                Path(args.repo_dir),
+                check_history=bool(args.check_history),
+            )
+            print(json.dumps(res, indent=2, ensure_ascii=True))
+            return 0
+        except StateCryptoError as exc:
+            print(json.dumps({"error": str(exc)}), file=sys.stderr)
+            return 2
+
+    if args.command == "state-migrate-restore":
+        try:
+            encryptor = StateEncryptor()
+            res = encryptor.migrate_or_restore(
+                state_dir=config.state_dir,
+                encrypted_dir=Path(args.encrypted_dir),
+                legacy_state_dir=Path(args.legacy_state_dir) if args.legacy_state_dir else None,
+                allow_empty=bool(args.allow_empty),
+            )
+            print(json.dumps(res, indent=2, ensure_ascii=True))
+            return 0
+        except StateCryptoError as exc:
+            print(json.dumps({"error": str(exc)}), file=sys.stderr)
+            return 2
 
     if args.command == "state-unpack":
         try:
