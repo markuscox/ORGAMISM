@@ -1,4 +1,4 @@
-"""CLI entrypoint for running discrete ORGANISM wake cycles, resumptions, approvals, experiments, and benchmarks."""
+"""CLI entrypoint for running discrete ORGANISM wake cycles, resumptions, approvals, encrypted state, Telegram polling, and benchmarks."""
 
 from __future__ import annotations
 
@@ -6,15 +6,23 @@ import argparse
 import json
 import sys
 import uuid
+from pathlib import Path
 
 from organism.config.settings import load_config
 from organism.evaluation.benchmarks import run_all_benchmarks
+from organism.integrations.telegram import TelegramBridge
 from organism.kernel.contracts import CognitiveEvent, TrustLevel
 from organism.kernel.runtime import CognitiveKernel
+from organism.safety.state_crypto import (
+    StateCryptoError,
+    StateEncryptor,
+    assert_no_plaintext_in_publish_dir,
+    generate_fernet_key,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="ORGANISM Stage 2 Cognitive Kernel CLI")
+    parser = argparse.ArgumentParser(description="ORGANISM Stage 3 Cognitive Kernel CLI")
     parser.add_argument("--state-dir", default=None, help="Override state directory path")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -38,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     wake.add_argument("--approved", action="store_true", help="Explicit human approval flag")
     wake.add_argument("--crash-at-step", type=int, default=None, help="Simulate crash after step N")
     wake.add_argument("--fault-organ", default=None, help="Simulate isolated fault in named organ")
+    wake.add_argument("--session-id", default="default", help="Logical dialogue session identifier")
 
     resume = sub.add_parser("resume", help="Resume an interrupted RUNNING cycle")
     resume.add_argument("--cycle-id", default=None, help="Specific cycle_id to resume")
@@ -56,6 +65,22 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("forget", help="Run controlled selective forgetting on stale unverified clutter")
     sub.add_parser("status", help="Output full persisted organism state as JSON")
     sub.add_parser("eval", help="Run Stage 1 + Stage 2 automated capability benchmarks")
+
+    # Stage 3 state encryption & Telegram polling commands
+    sub.add_parser("keygen", help="Generate a fresh Fernet key for ORGANISM_STATE_ENCRYPTION_KEY")
+
+    pack = sub.add_parser("state-pack", help="Safely backup SQLite WAL + encrypt state bundle")
+    pack.add_argument("--encrypted-dir", default="encrypted_state", help="Output directory for encrypted bundle")
+    pack.add_argument("--verify-no-plaintext", action="store_true", help="Verify zero plaintext artifacts exist")
+
+    unpack = sub.add_parser("state-unpack", help="Decrypt and integrity-check encrypted state bundle")
+    unpack.add_argument("--encrypted-dir", default="encrypted_state", help="Input directory containing encrypted bundle")
+    unpack.add_argument("--allow-empty", action="store_true", help="Allow initialization if bundle does not exist yet")
+
+    tg = sub.add_parser("telegram-poll", help="Poll Telegram Bot API once and process verified owner updates")
+    tg.add_argument("--limit", type=int, default=25, help="Maximum updates to fetch")
+    tg.add_argument("--timeout", type=int, default=5, help="Telegram long-poll timeout in seconds")
+
     return parser
 
 
@@ -63,6 +88,50 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     config = load_config(state_dir_override=args.state_dir)
+
+    if args.command == "keygen":
+        print(generate_fernet_key())
+        return 0
+
+    if args.command == "state-unpack":
+        try:
+            encryptor = StateEncryptor()
+        except StateCryptoError as exc:
+            print(json.dumps({"error": str(exc)}), file=sys.stderr)
+            return 2
+
+        enc_dir = Path(args.encrypted_dir)
+        bundle = enc_dir / StateEncryptor.BUNDLE_FILENAME
+        if not bundle.exists():
+            if args.allow_empty:
+                config.state_dir.mkdir(parents=True, exist_ok=True)
+                print(json.dumps({"unpacked": False, "initialized_empty": True}, indent=2))
+                return 0
+            print(json.dumps({"error": f"Encrypted bundle missing at {bundle}"}), file=sys.stderr)
+            return 2
+        try:
+            result = encryptor.unpack_state_dir(enc_dir, config.state_dir)
+            print(json.dumps({"unpacked": True, **result}, indent=2, ensure_ascii=True))
+            return 0
+        except StateCryptoError as exc:
+            print(json.dumps({"error": str(exc)}), file=sys.stderr)
+            return 2
+
+    if args.command == "state-pack":
+        try:
+            # Ensure DB/snapshot exists cleanly before packing
+            kernel = CognitiveKernel(config=config)
+            kernel.store.export_snapshot()
+            encryptor = StateEncryptor()
+            meta = encryptor.pack_state_dir(config.state_dir, Path(args.encrypted_dir))
+            if args.verify_no_plaintext:
+                assert_no_plaintext_in_publish_dir(Path(args.encrypted_dir))
+            print(json.dumps({"packed": True, **meta}, indent=2, ensure_ascii=True))
+            return 0
+        except StateCryptoError as exc:
+            print(json.dumps({"error": str(exc)}), file=sys.stderr)
+            return 2
+
     kernel = CognitiveKernel(config=config)
 
     if args.command == "status":
@@ -73,6 +142,12 @@ def main(argv: list[str] | None = None) -> int:
         report = run_all_benchmarks(record_to_store=kernel)
         print(json.dumps(report, indent=2, ensure_ascii=True))
         return 0 if report["failed"] == 0 else 1
+
+    if args.command == "telegram-poll":
+        bridge = TelegramBridge(kernel=kernel)
+        res = bridge.poll_once(limit=args.limit, timeout=args.timeout)
+        print(json.dumps(res, indent=2, ensure_ascii=True))
+        return 0
 
     if args.command == "experiment":
         res = kernel.run_active_experiment(args.exp_id)
@@ -105,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
             trust_level=TrustLevel(args.trust),
             event_type=args.event_type,
             content=args.event,
+            metadata={"session_id": args.session_id},
         )
         cp = kernel.run_cycle(
             event=ev,

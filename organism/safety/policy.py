@@ -26,10 +26,14 @@ class SecurityPolicy:
 
     INJECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ("ignore_instructions", re.compile(r"ignore\s+(all\s+)?(previous|prior|system)\s+instructions?", re.I)),
+        ("ignore_instructions_ru", re.compile(r"игнорируй\s+(все\s+)?(предыдущие|системные|прошлые)\s+инструкц", re.I)),
         ("override_policy", re.compile(r"(override|bypass|disable)\s+(safety|security|policy|rules|permissions)", re.I)),
+        ("override_policy_ru", re.compile(r"(обойди|отключи|сбрось)\s+(защит|безопасност|правил|ограничен)", re.I)),
         ("grant_privilege", re.compile(r"(grant|elevate|give)\s+(yourself|me|root|admin)\s+(permission|access|privilege)", re.I)),
         ("reveal_secret", re.compile(r"(reveal|print|dump|exfiltrate|send)\s+(the\s+)?(api[_\s]?key|secret|token|credentials|env)", re.I)),
+        ("reveal_secret_ru", re.compile(r"(покажи|выведи|раскрой|отправь|слей)\s+(все\s+)?(секрет|ключ|токен|парол)", re.I)),
         ("shell_execution", re.compile(r"(run|execute|eval|exec)\s+(shell|bash|python|arbitrary\s+code|rm\s+-rf|subprocess)", re.I)),
+        ("shell_execution_ru", re.compile(r"(выполни|запусти)\s+(shell|bash|python|произвольн\w+\s+код|команд\w+\s+в\s+терминал)", re.I)),
         ("role_hijack", re.compile(r"^\s*(system|developer)\s*:\s*", re.I | re.M)),
     )
 
@@ -44,8 +48,9 @@ class SecurityPolicy:
         re.compile(r"sk-[0-9A-Za-z\-_]{16,}"),
         re.compile(r"ghp_[0-9A-Za-z]{20,}"),
         re.compile(r"github_pat_[0-9A-Za-z_]{20,}"),
-        re.compile(r"(?i)(GEMINI_API_KEY|API_KEY|SECRET_KEY|ACCESS_TOKEN|PASSWORD)\s*[:=]\s*['\"]?([^\s'\"]{6,})['\"]?"),
+        re.compile(r"(?i)(GEMINI_API_KEY|TELEGRAM_BOT_TOKEN|ORGANISM_STATE_ENCRYPTION_KEY|ORGANISM_ADMIN_TOKEN|API_KEY|SECRET_KEY|ACCESS_TOKEN|PASSWORD)\s*[:=]\s*['\"]?([^\s'\"]{6,})['\"]?"),
         re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*"),
+        re.compile(r"\b\d{7,12}:[A-Za-z0-9_-]{30,}\b"),
     )
 
     @classmethod
@@ -55,12 +60,18 @@ class SecurityPolicy:
         redacted = text
         count = 0
 
-        # Also redact the live GEMINI_API_KEY value if set in env
-        live_key = os.environ.get("GEMINI_API_KEY", "").strip()
-        if live_key and len(live_key) >= 8 and live_key in redacted:
-            occurrences = redacted.count(live_key)
-            redacted = redacted.replace(live_key, "[REDACTED_GEMINI_API_KEY]")
-            count += occurrences
+        # Redact live secret values if set in environment
+        for env_name in (
+            "GEMINI_API_KEY",
+            "TELEGRAM_BOT_TOKEN",
+            "ORGANISM_STATE_ENCRYPTION_KEY",
+            "ORGANISM_ADMIN_TOKEN",
+        ):
+            live_val = os.environ.get(env_name, "").strip()
+            if live_val and len(live_val) >= 8 and live_val in redacted:
+                occurrences = redacted.count(live_val)
+                redacted = redacted.replace(live_val, f"[REDACTED_{env_name}]")
+                count += occurrences
 
         for idx, pattern in enumerate(cls.SECRET_PATTERNS):
             def _repl(match: re.Match[str], p_idx: int = idx) -> str:

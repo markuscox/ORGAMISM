@@ -207,7 +207,10 @@ class CognitiveKernel:
         )
 
     def approve_cycle(self, cycle_id: str, approve: bool) -> CycleCheckpoint | None:
-        checkpoint = self.store.get_checkpoint(cycle_id)
+        cleaned_id = str(cycle_id or "").strip()
+        if not cleaned_id or cleaned_id.lower() in {"all", "*", "any"}:
+            return None
+        checkpoint = self.store.get_checkpoint(cleaned_id)
         if checkpoint is None:
             return None
         if checkpoint.status != CycleStatus.WAITING:
@@ -218,7 +221,7 @@ class CognitiveKernel:
             checkpoint.status = CycleStatus.FAILED_SAFE
             checkpoint.outcome_summary = "Human operator rejected high-impact action; terminated safely."
             self.audit.log(
-                cycle_id=cycle_id,
+                cycle_id=cleaned_id,
                 severity="LOW",
                 rule_triggered="human_approval_rejected",
                 action_decision="blocked",
@@ -226,11 +229,11 @@ class CognitiveKernel:
             )
             self.store.save_checkpoint(checkpoint)
             self.store.record_idempotency(
-                checkpoint.operation_id, cycle_id, CycleStatus.FAILED_SAFE, checkpoint.outcome_summary
+                checkpoint.operation_id, cleaned_id, CycleStatus.FAILED_SAFE, checkpoint.outcome_summary
             )
             return checkpoint
 
-        return self.resume_cycle(cycle_id=cycle_id, approved_by_human=True)
+        return self.resume_cycle(cycle_id=cleaned_id, approved_by_human=True)
 
     def _execute_from_step(
         self,
@@ -243,6 +246,7 @@ class CognitiveKernel:
         degraded_organs: list[str] = []
         identity = self.store.get_identity()
         cycle_number = int(identity.get("total_cycles", 0)) + 1
+        session_id = str(event.metadata.get("session_id", "default"))[:64]
 
         def record_step(
             step_num: int,
@@ -311,10 +315,14 @@ class CognitiveKernel:
                 )
                 check_crash(2)
 
-            # Step 3: Retrieve Memories (ACT-R activation + spacing reinforcement)
+            # Step 3: Retrieve Memories (ACT-R activation + Unicode + session dialogue context)
             if checkpoint.current_step < 3:
                 query = str(checkpoint.perception_data.get("normalized_text", event.content))
-                memories = self.retriever.retrieve(query, top_k=self.config.retrieval_top_k)
+                memories = self.retriever.retrieve(
+                    query,
+                    top_k=self.config.retrieval_top_k,
+                    session_id=session_id,
+                )
                 checkpoint.retrieved_memories = memories
                 record_step(
                     3,
@@ -556,11 +564,16 @@ class CognitiveKernel:
 
             # Step 11: Execute Permitted Operation
             if checkpoint.current_step < 11:
+                recent_dialogue = self.retriever.retrieve_dialogue_history(
+                    session_id=session_id,
+                    limit=6,
+                )
                 rep = self._run_organ_isolated(
                     self.reasoning,
                     {
                         "perception": checkpoint.perception_data,
                         "retrieved_memories": checkpoint.retrieved_memories,
+                        "recent_dialogue": recent_dialogue,
                         "workspace_items": checkpoint.workspace_snapshot,
                         "active_goal": checkpoint.active_goal,
                         "mode": checkpoint.mode,
@@ -702,6 +715,7 @@ class CognitiveKernel:
                         "action_taken": checkpoint.executive_decision.get("decision", "ACT"),
                         "outcome_status": CycleStatus.COMPLETED.value,
                         "outcome_summary": answer,
+                        "session_id": session_id,
                         "metadata": {
                             "tokens_used": checkpoint.tokens_used,
                             "degraded_organs": degraded_organs,
@@ -824,6 +838,7 @@ class CognitiveKernel:
             outcome_status=target_status.value,
             outcome_summary=reason,
             metadata={"degraded_organs": degraded_organs, "halted_at_step": checkpoint.current_step},
+            session_id=str(event.metadata.get("session_id", "default"))[:64],
         )
         self.store.update_identity_metrics(increment_cycles=1)
         if target_status == CycleStatus.FAILED_SAFE:

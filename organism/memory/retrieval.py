@@ -1,17 +1,118 @@
-"""Cognitive memory retrieval: ACT-R activation decay, episodic sequences, temporal queries, graph traversal, and selective forgetting."""
+"""Cognitive memory retrieval: Unicode tokenization, ACT-R decay, dialogue context, sequences, graph traversal, and forgetting."""
 
 from __future__ import annotations
 
 import math
-import re
+import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
 from .storage import SQLiteMemoryStore
 
 
+_RU_SUFFIXES = (
+    "ями",
+    "ами",
+    "ого",
+    "его",
+    "ому",
+    "ему",
+    "ыми",
+    "ими",
+    "ов",
+    "ев",
+    "ам",
+    "ям",
+    "ах",
+    "ях",
+    "ом",
+    "ем",
+    "ой",
+    "ей",
+    "ий",
+    "ый",
+    "ая",
+    "яя",
+    "ое",
+    "ее",
+    "ие",
+    "ые",
+    "ут",
+    "ют",
+    "ат",
+    "ят",
+    "ть",
+    "а",
+    "я",
+    "у",
+    "ю",
+    "е",
+    "и",
+    "ы",
+    "о",
+)
+
+_EN_SUFFIXES = ("ing", "ed", "es", "s")
+
+
+def _light_stem(token: str) -> str:
+    if len(token) <= 4:
+        return token
+    has_cyrillic = any("а" <= ch <= "я" or ch == "ё" for ch in token)
+    if has_cyrillic:
+        for suf in _RU_SUFFIXES:
+            if token.endswith(suf) and len(token) - len(suf) >= 3:
+                return token[: -len(suf)]
+    elif token.isascii() and token.isalpha():
+        for suf in _EN_SUFFIXES:
+            if token.endswith(suf) and len(token) - len(suf) >= 4:
+                return token[: -len(suf)]
+    return token
+
+
+def tokenize_unicode(text: str) -> set[str]:
+    """
+    Unicode-aware tokenizer supporting Cyrillic, Latin, digits, and any Unicode letter/number script.
+    Splits on whitespace/punctuation using `unicodedata.category`.
+    """
+    tokens: list[str] = []
+    buf: list[str] = []
+    for ch in text.lower():
+        cat = unicodedata.category(ch)
+        if ch == "_" or (cat and cat[0] in ("L", "N")):
+            buf.append(ch)
+        elif buf:
+            tokens.append("".join(buf))
+            buf.clear()
+    if buf:
+        tokens.append("".join(buf))
+
+    out: set[str] = set()
+    for tok in tokens:
+        if len(tok) >= 2:
+            out.add(tok)
+        elif tok and any(unicodedata.category(c) == "Lo" for c in tok):
+            # Support single-character ideographs (CJK, etc.)
+            out.add(tok)
+    return out
+
+
 def _tokenize(text: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9_]{2,}", text.lower()))
+    return tokenize_unicode(text)
+
+
+def _token_overlap_score(query_tokens: set[str], target_text: str) -> float:
+    if not query_tokens:
+        return 0.0
+    target_tokens = tokenize_unicode(target_text)
+    if not target_tokens:
+        return 0.0
+    exact_hits = len(query_tokens & target_tokens)
+    query_stems = {_light_stem(t) for t in query_tokens}
+    target_stems = {_light_stem(t) for t in target_tokens}
+    stem_hits = len(query_stems & target_stems)
+    effective_hits = max(float(exact_hits), 0.75 * float(stem_hits))
+    return effective_hits / max(1, len(query_tokens))
 
 
 def compute_actr_activation(
@@ -38,22 +139,27 @@ def compute_actr_activation(
 
 
 class MemoryRetriever:
-    """Retrieves relevant episodic, semantic, and working memories with activation decay and sequences."""
+    """Retrieves relevant episodic, semantic, dialogue, and working memories across Unicode languages."""
 
     def __init__(self, store: SQLiteMemoryStore, decay_rate: float = 0.5) -> None:
         self._store = store
         self.decay_rate = decay_rate
 
-    def retrieve(self, query_text: str, top_k: int = 5) -> list[dict[str, Any]]:
-        query_tokens = _tokenize(query_text)
+    def retrieve(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        session_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query_tokens = tokenize_unicode(query_text)
         candidates: list[dict[str, Any]] = []
         now = datetime.now(timezone.utc)
 
         for wm in self._store.list_working_memory():
             text = f"{wm['key']} {wm['value']}"
-            overlap = len(query_tokens & _tokenize(text))
+            overlap = _token_overlap_score(query_tokens, text)
             if overlap > 0 or not query_tokens:
-                score = 0.4 * wm["priority"] + (overlap / max(1, len(query_tokens)))
+                score = 0.4 * wm["priority"] + overlap
                 candidates.append(
                     {
                         "layer": "working",
@@ -69,11 +175,11 @@ class MemoryRetriever:
                     }
                 )
 
-        for fact in self._store.list_semantic_facts(include_invalidated=False, include_forgotten=False, limit=120):
+        for fact in self._store.list_semantic_facts(include_invalidated=False, include_forgotten=False, limit=160):
             if fact["status"] == "rejected":
                 continue
             text = f"{fact['subject']} {fact['predicate']} {fact['object_value']}"
-            overlap = len(query_tokens & _tokenize(text))
+            overlap = _token_overlap_score(query_tokens, text)
             if overlap > 0 or not query_tokens:
                 activation = compute_actr_activation(
                     int(fact.get("access_count", 1)),
@@ -86,7 +192,7 @@ class MemoryRetriever:
                     0.45 * float(fact["confidence"])
                     + 0.2 * activation
                     + status_bonus
-                    + (overlap / max(1, len(query_tokens)))
+                    + overlap
                 )
                 candidates.append(
                     {
@@ -103,22 +209,32 @@ class MemoryRetriever:
                     }
                 )
 
-        for ep in self._store.list_episodes(limit=40):
+        episodes_pool = self._store.list_episodes(limit=60, session_id=session_id)
+        if session_id:
+            # Also allow cross-session semantic/episodic recall if session-local is sparse
+            seen_ep = {ep["episode_id"] for ep in episodes_pool}
+            for ep in self._store.list_episodes(limit=40):
+                if ep["episode_id"] not in seen_ep:
+                    episodes_pool.append(ep)
+
+        for ep in episodes_pool:
             text = f"{ep['event_content']} {ep['outcome_summary']}"
-            overlap = len(query_tokens & _tokenize(text))
+            overlap = _token_overlap_score(query_tokens, text)
             if overlap > 0:
                 activation = compute_actr_activation(1, ep["created_at"], decay_rate=self.decay_rate, now=now)
-                score = 0.2 + 0.15 * activation + (overlap / max(1, len(query_tokens)))
+                session_bonus = 0.12 if (session_id and ep.get("session_id") == session_id) else 0.0
+                score = 0.2 + 0.15 * activation + session_bonus + overlap
                 candidates.append(
                     {
                         "layer": "episodic",
                         "id": ep["episode_id"],
-                        "summary": f"[{ep['outcome_status']}] {ep['outcome_summary']}",
-                        "epistemic_type": "fact",
-                        "status": "recorded",
-                        "confidence": 0.8,
+                        "summary": f"{ep['event_content']} -> {ep['outcome_summary']}",
+                        "epistemic_type": ep.get("metadata", {}).get("epistemic_type", "unknown"),
+                        "status": "recorded_episode",
+                        "confidence": 0.55,
                         "activation": activation,
                         "source": ep["source"],
+                        "session_id": ep.get("session_id", "default"),
                         "score": round(score, 4),
                         "timestamp": ep["created_at"],
                     }
@@ -133,6 +249,35 @@ class MemoryRetriever:
                 self._store.touch_semantic_fact(item["id"], float(item.get("activation", 0.5)))
 
         return selected
+
+    def retrieve_dialogue_history(
+        self,
+        session_id: str | None = None,
+        limit: int = 6,
+    ) -> list[dict[str, Any]]:
+        """
+        Return recent chronological conversational turns for dialogue continuity across restarts.
+        Clearly preserves layer='episodic' and unverified status so past utterances are not conflated with verified facts.
+        """
+        rows = self._store.list_episodes(limit=limit, session_id=session_id)
+        rows.reverse()  # chronological order (oldest -> newest)
+        turns: list[dict[str, Any]] = []
+        for ep in rows:
+            meta = ep.get("metadata", {})
+            turns.append(
+                {
+                    "episode_id": ep["episode_id"],
+                    "session_id": ep.get("session_id", "default"),
+                    "user_message": ep["event_content"],
+                    "assistant_response": ep["outcome_summary"],
+                    "outcome_status": ep["outcome_status"],
+                    "epistemic_type": meta.get("epistemic_type", "unknown"),
+                    "layer": "episodic",
+                    "verified": False,
+                    "created_at": ep["created_at"],
+                }
+            )
+        return turns
 
     def retrieve_episode_sequence(
         self,

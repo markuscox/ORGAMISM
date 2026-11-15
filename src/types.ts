@@ -339,4 +339,8 @@ export interface OrganismFullState {
   replay_buffer: ReplayExperience[];
   replay_buffer_count?: number;
   snapshot_integrity_valid: boolean;
+  authenticated?: boolean;
+  auth_required?: boolean;
+  admin_configured?: boolean;
+  redacted_private_state?: boolean;
 }

@@ -1,0 +1,91 @@
+name: ORGANISM Telegram Polling
+
+on:
+  schedule:
+    # GitHub Actions schedules may experience queuing delays; polling persists offset in encrypted SQLite.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: organism-state-persistence
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  telegram-poll:
+    runs-on: ubuntu-latest
+    env:
+      ORGANISM_STATE_DIR: ${{ runner.temp }}/organism_state
+      ENCRYPTED_DIR: ${{ runner.temp }}/encrypted_state
+    steps:
+      - name: Checkout code branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: python3 -m pip install -r requirements.txt
+
+      - name: Restore encrypted state from organism-state branch
+        run: |
+          mkdir -p "$ENCRYPTED_DIR" "$ORGANISM_STATE_DIR"
+          git config user.name "organism-runner[bot]"
+          git config user.email "organism-runner[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin organism-state >/dev/null 2>&1; then
+            git fetch origin organism-state
+            git checkout -B organism-state-tmp origin/organism-state
+            if [ -d encrypted_state ]; then
+              cp -r encrypted_state/. "$ENCRYPTED_DIR"/
+            fi
+            git checkout "${{ github.ref_name }}"
+          fi
+
+      - name: Decrypt state and verify integrity (fail-closed)
+        env:
+          ORGANISM_STATE_ENCRYPTION_KEY: ${{ secrets.ORGANISM_STATE_ENCRYPTION_KEY }}
+        run: |
+          python3 main.py --state-dir "$ORGANISM_STATE_DIR" state-unpack --encrypted-dir "$ENCRYPTED_DIR" --allow-empty
+
+      - name: Run automated tests before processing Telegram updates
+        run: |
+          python3 -m unittest discover -s organism/tests -v
+
+      - name: Poll Telegram updates and route authorized owner messages to CognitiveKernel
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_OWNER_ID: ${{ secrets.TELEGRAM_OWNER_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python3 main.py --state-dir "$ORGANISM_STATE_DIR" telegram-poll --limit 25 --timeout 5 >/dev/null
+
+      - name: Encrypt updated SQLite, snapshot, and Telegram offset
+        env:
+          ORGANISM_STATE_ENCRYPTION_KEY: ${{ secrets.ORGANISM_STATE_ENCRYPTION_KEY }}
+        run: |
+          python3 main.py --state-dir "$ORGANISM_STATE_DIR" state-pack --encrypted-dir "$ENCRYPTED_DIR" --verify-no-plaintext
+
+      - name: Commit encrypted-only state to organism-state branch
+        run: |
+          if git ls-remote --exit-code --heads origin organism-state >/dev/null 2>&1; then
+            git fetch origin organism-state
+            git checkout -B organism-state origin/organism-state
+          else
+            git checkout --orphan organism-state
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+          rm -rf state encrypted_state
+          mkdir -p encrypted_state
+          cp -r "$ENCRYPTED_DIR"/. encrypted_state/
+          rm -rf "$ORGANISM_STATE_DIR" "$ENCRYPTED_DIR"
+          git add -A encrypted_state/
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(telegram): persist encrypted cognitive state ${{ github.run_id }}"
+            git push origin organism-state
+          else
+            echo "No state changes to commit."
+          fi

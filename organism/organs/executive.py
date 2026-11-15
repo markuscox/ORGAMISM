@@ -30,10 +30,14 @@ class ExecutiveOrgan(OrganContract):
             decision = "DEFER_QUOTA"
             target_outcome = "DEFERRED"
             rationale = str(risk.get("budget_reason", "Token/request budget exhausted"))
-        elif plan.get("estimated_tokens", 0) == 0:
+        elif plan.get("estimated_tokens", 0) == 0 or not risk.get("llm_permitted", True):
             decision = "ACT_DETERMINISTIC"
             target_outcome = "COMPLETED"
-            rationale = "Task solvable deterministically at zero token cost"
+            rationale = (
+                "Task solvable deterministically at zero token cost"
+                if plan.get("estimated_tokens", 0) == 0
+                else str(risk.get("llm_permission_reason", "LLM access prohibited for trust level"))
+            )
         else:
             decision = "ACT_WITH_LLM"
             target_outcome = "COMPLETED"

@@ -28,6 +28,7 @@ class EpisodicMemoryOrgan(OrganContract):
             outcome_status=str(context["outcome_status"]),
             outcome_summary=str(context["outcome_summary"]),
             metadata=dict(context.get("metadata", {})),
+            session_id=str(context.get("session_id", "default")),
         )
         return OrganReport(
             organ_name=self.name,

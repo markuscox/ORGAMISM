@@ -153,6 +153,14 @@ export default function App() {
   const [latestUnitOutput, setLatestUnitOutput] = useState<{ ok: boolean; output: string } | null>(
     null
   );
+  const [adminToken, setAdminToken] = useState<string>(() => {
+    try {
+      return window.sessionStorage.getItem("organism_admin_token") || "";
+    } catch {
+      return "";
+    }
+  });
+  const [tokenInput, setTokenInput] = useState("");
 
   // Stimulus form state
   const [eventText, setEventText] = useState(PRESETS[0].event);
@@ -162,9 +170,19 @@ export default function App() {
   const [crashAtStep, setCrashAtStep] = useState<string>("");
   const [faultOrgan, setFaultOrgan] = useState<string>("");
 
+  const authHeaders = useCallback(
+    (includeJson = false): Record<string, string> => {
+      const headers: Record<string, string> = {};
+      if (includeJson) headers["Content-Type"] = "application/json";
+      if (adminToken.trim()) headers["Authorization"] = `Bearer ${adminToken.trim()}`;
+      return headers;
+    },
+    [adminToken]
+  );
+
   const fetchState = useCallback(async () => {
     try {
-      const res = await fetch("/api/state");
+      const res = await fetch("/api/state", { headers: authHeaders(false) });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to load state");
       setState(data);
@@ -174,7 +192,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [authHeaders]);
 
   useEffect(() => {
     fetchState();
@@ -197,7 +215,7 @@ export default function App() {
       const parsedCrash = crashAtStep.trim() ? Number.parseInt(crashAtStep, 10) : undefined;
       const res = await fetch("/api/cycle/wake", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(true),
         body: JSON.stringify({
           event: eventText,
           source: sourceName.trim() || "web_observatory",
@@ -228,7 +246,7 @@ export default function App() {
     try {
       const res = await fetch("/api/cycle/resume", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(true),
         body: JSON.stringify({ cycleId }),
       });
       const data = await res.json();
@@ -249,7 +267,7 @@ export default function App() {
     try {
       const res = await fetch("/api/cycle/approve", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(true),
         body: JSON.stringify({ cycleId, decision }),
       });
       const data = await res.json();
@@ -268,7 +286,10 @@ export default function App() {
     setRunningEval(true);
     setError(null);
     try {
-      const res = await fetch("/api/eval/run", { method: "POST" });
+      const res = await fetch("/api/eval/run", {
+        method: "POST",
+        headers: authHeaders(false),
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Evaluation suite failed");
       setLatestUnitOutput(data.unitResult);
@@ -285,7 +306,10 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch("/api/state/reset", { method: "POST" });
+      const res = await fetch("/api/state/reset", {
+        method: "POST",
+        headers: authHeaders(false),
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "State reset failed");
       setState(data);
@@ -304,7 +328,7 @@ export default function App() {
     try {
       const res = await fetch("/api/experiments/run", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(true),
         body: JSON.stringify({ experimentId }),
       });
       const data = await res.json();
@@ -322,7 +346,10 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch("/api/continual/replay", { method: "POST" });
+      const res = await fetch("/api/continual/replay", {
+        method: "POST",
+        headers: authHeaders(false),
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Replay rehearsal failed");
       if (data.state) setState(data.state);
@@ -338,7 +365,10 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch("/api/memory/forget", { method: "POST" });
+      const res = await fetch("/api/memory/forget", {
+        method: "POST",
+        headers: authHeaders(false),
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Controlled forgetting failed");
       if (data.state) setState(data.state);
@@ -477,6 +507,71 @@ export default function App() {
       <main className="flex-1 max-w-[1440px] w-full mx-auto p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         {/* Left Control & Stimulus Rail */}
         <aside className="lg:col-span-4 xl:col-span-3 space-y-6">
+          {/* Admin Authorization Gate */}
+          <section className="bg-white border border-slate-200 rounded-lg p-4 space-y-3">
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-semibold text-slate-900">Operator Access</span>
+              <span
+                className={`font-mono ${
+                  state?.authenticated ? "text-emerald-700" : "text-amber-700"
+                }`}
+              >
+                {state?.authenticated ? "● AUTHORIZED" : "▲ READ-ONLY SUMMARY"}
+              </span>
+            </div>
+            {!state?.authenticated ? (
+              <div className="space-y-2">
+                <p className="text-xs text-slate-500">
+                  {state?.admin_configured
+                    ? "Private memories & control endpoints are locked. Enter ORGANISM_ADMIN_TOKEN to unlock."
+                    : "Server ORGANISM_ADMIN_TOKEN is unset; mutating routes are disabled in fail-closed mode."}
+                </p>
+                {state?.admin_configured && (
+                  <div className="flex gap-2">
+                    <input
+                      type="password"
+                      value={tokenInput}
+                      onChange={(e) => setTokenInput(e.target.value)}
+                      placeholder="Bearer admin token"
+                      className="flex-1 min-w-0 px-2.5 py-1.5 text-xs font-mono bg-white border border-slate-200 rounded-md"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const t = tokenInput.trim();
+                        if (!t) return;
+                        try {
+                          window.sessionStorage.setItem("organism_admin_token", t);
+                        } catch {}
+                        setAdminToken(t);
+                        setTokenInput("");
+                      }}
+                      className="px-3 py-1.5 text-xs font-medium bg-slate-900 text-white rounded-md hover:bg-slate-800 whitespace-nowrap shrink-0"
+                    >
+                      Unlock
+                    </button>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-slate-500">Session Bearer token active</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    try {
+                      window.sessionStorage.removeItem("organism_admin_token");
+                    } catch {}
+                    setAdminToken("");
+                  }}
+                  className="text-slate-500 hover:text-rose-700 font-mono"
+                >
+                  Lock
+                </button>
+              </div>
+            )}
+          </section>
+
           <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
             <div className="flex items-center justify-between gap-2 pb-3 border-b border-slate-200">
               <h2 className="text-sm font-semibold text-slate-900">Stimulus Injection</h2>

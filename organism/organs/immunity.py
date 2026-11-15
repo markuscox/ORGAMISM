@@ -88,26 +88,27 @@ class ImmunityOrgan(OrganContract):
         est_tokens = int(plan.get("estimated_tokens", 0))
         budget_ok = True
         budget_reason = "Deterministic zero-token execution"
+        llm_permitted, cap_reason = PermissionPolicy.evaluate(trust_level, Capability.CALL_LLM)
         if est_tokens > 0 and mode != "deterministic_only":
-            cap_ok, cap_reason = PermissionPolicy.evaluate(trust_level, Capability.CALL_LLM)
-            if not cap_ok:
-                # Untrusted external inputs cannot force paid/free LLM token spend on arbitrary prompts
+            if not llm_permitted:
+                # Untrusted external inputs cannot force LLM token spend on arbitrary prompts
                 self._audit.log(
                     cycle_id=cycle_id,
                     severity="LOW",
                     rule_triggered="untrusted_llm_restriction",
-                    action_decision="sanitized",
+                    action_decision="blocked_llm",
                     excerpt=cap_reason,
                 )
-            budget_ok, budget_reason = self._budget.can_spend(est_tokens)
-            if not budget_ok:
-                self._audit.log(
-                    cycle_id=cycle_id,
-                    severity="MEDIUM",
-                    rule_triggered="token_budget_exhausted",
-                    action_decision="deferred",
-                    excerpt=budget_reason,
-                )
+            else:
+                budget_ok, budget_reason = self._budget.can_spend(est_tokens)
+                if not budget_ok:
+                    self._audit.log(
+                        cycle_id=cycle_id,
+                        severity="MEDIUM",
+                        rule_triggered="token_budget_exhausted",
+                        action_decision="deferred",
+                        excerpt=budget_reason,
+                    )
 
         return OrganReport(
             organ_name=self.name,
@@ -116,6 +117,8 @@ class ImmunityOrgan(OrganContract):
                 "blocked": False,
                 "budget_ok": budget_ok,
                 "budget_reason": budget_reason,
+                "llm_permitted": llm_permitted,
+                "llm_permission_reason": cap_reason,
                 "trust_level": trust_level.value,
             },
             confidence=1.0,

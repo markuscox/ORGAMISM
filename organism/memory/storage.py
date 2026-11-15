@@ -100,6 +100,7 @@ class SQLiteMemoryStore:
                     metadata_json TEXT NOT NULL,
                     prev_episode_id TEXT,
                     sequence_index INTEGER NOT NULL DEFAULT 0,
+                    session_id TEXT NOT NULL DEFAULT 'default',
                     created_at TEXT NOT NULL
                 );
 
@@ -267,6 +268,17 @@ class SQLiteMemoryStore:
                     metrics_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS telegram_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    last_update_id INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS telegram_processed_updates (
+                    update_id INTEGER PRIMARY KEY,
+                    processed_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -296,6 +308,8 @@ class SQLiteMemoryStore:
                 conn.execute("ALTER TABLE episodes ADD COLUMN prev_episode_id TEXT")
             if "sequence_index" not in ep_cols:
                 conn.execute("ALTER TABLE episodes ADD COLUMN sequence_index INTEGER NOT NULL DEFAULT 0")
+            if "session_id" not in ep_cols:
+                conn.execute("ALTER TABLE episodes ADD COLUMN session_id TEXT NOT NULL DEFAULT 'default'")
 
     def _ensure_identity(self) -> None:
         now = utc_now_iso()
@@ -569,10 +583,12 @@ class SQLiteMemoryStore:
         outcome_status: str,
         outcome_summary: str,
         metadata: dict[str, Any],
+        session_id: str = "default",
     ) -> str:
         episode_id = f"ep_{uuid.uuid4().hex[:12]}"
         safe_content, _ = SecurityPolicy.redact_secrets(event_content)
         safe_summary, _ = SecurityPolicy.redact_secrets(outcome_summary)
+        sess = str(session_id or "default")[:64]
         with self._connect() as conn:
             prev_row = conn.execute(
                 "SELECT episode_id, sequence_index FROM episodes ORDER BY sequence_index DESC, created_at DESC LIMIT 1"
@@ -584,8 +600,8 @@ class SQLiteMemoryStore:
                 INSERT INTO episodes (
                     episode_id, cycle_id, event_id, source, trust_level,
                     event_content, action_taken, outcome_status, outcome_summary,
-                    metadata_json, prev_episode_id, sequence_index, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    metadata_json, prev_episode_id, sequence_index, session_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     episode_id,
@@ -597,20 +613,27 @@ class SQLiteMemoryStore:
                     action_taken,
                     outcome_status,
                     safe_summary,
-                    json.dumps(metadata, ensure_ascii=True),
+                    json.dumps(metadata, ensure_ascii=False),
                     prev_ep_id,
                     next_seq,
+                    sess,
                     utc_now_iso(),
                 ),
             )
         return episode_id
 
-    def list_episodes(self, limit: int = 40) -> list[dict[str, Any]]:
+    def list_episodes(self, limit: int = 40, session_id: str | None = None) -> list[dict[str, Any]]:
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM episodes ORDER BY sequence_index DESC, created_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            if session_id:
+                rows = conn.execute(
+                    "SELECT * FROM episodes WHERE session_id = ? ORDER BY sequence_index DESC, created_at DESC LIMIT ?",
+                    (session_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM episodes ORDER BY sequence_index DESC, created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
         out = []
         for r in rows:
             item = dict(r)
@@ -1414,6 +1437,48 @@ class SQLiteMemoryStore:
         item = dict(row)
         item["metrics"] = json.loads(item.pop("metrics_json"))
         return item
+
+    def get_telegram_offset(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT last_update_id FROM telegram_state WHERE id = 1").fetchone()
+        return int(row["last_update_id"]) if row is not None else 0
+
+    def save_telegram_offset(self, last_update_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO telegram_state (id, last_update_id, updated_at)
+                VALUES (1, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    last_update_id = MAX(telegram_state.last_update_id, excluded.last_update_id),
+                    updated_at = excluded.updated_at
+                """,
+                (int(last_update_id), utc_now_iso()),
+            )
+
+    def is_telegram_update_processed(self, update_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM telegram_processed_updates WHERE update_id = ?",
+                (int(update_id),),
+            ).fetchone()
+        return row is not None
+
+    def mark_telegram_update_processed(self, update_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO telegram_processed_updates (update_id, processed_at) VALUES (?, ?)",
+                (int(update_id), utc_now_iso()),
+            )
+            # Keep dedup table bounded to 2000 most recent update IDs
+            conn.execute(
+                """
+                DELETE FROM telegram_processed_updates
+                WHERE update_id NOT IN (
+                    SELECT update_id FROM telegram_processed_updates ORDER BY update_id DESC LIMIT 2000
+                )
+                """
+            )
 
     def export_snapshot(self) -> dict[str, Any]:
         payload = {
