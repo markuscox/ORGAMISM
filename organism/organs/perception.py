@@ -31,6 +31,7 @@ class PerceptionOrgan(OrganContract):
         r"^(?:hypothesis|assume|suppose|maybe|predict)\s*[:\-]?\s*(.+)$",
         re.I,
     )
+    QUERY_PREFIX = re.compile(r"^(?:query|recall|lookup)\s*[:\-]\s*(.+)$", re.I)
 
     def execute(self, context: dict[str, Any]) -> OrganReport:
         t0 = time.perf_counter()
@@ -74,7 +75,9 @@ class PerceptionOrgan(OrganContract):
         elif m := self.HYPOTHESIS_ASSERTION.match(text):
             detected_intent = "hypothesis_evaluation"
             epistemic_hint = EpistemicType.HYPOTHESIS.value
-        elif "?" in text and any(k in text.lower() for k in ("status", "what do you know", "recall", "remember")):
+        elif self.QUERY_PREFIX.match(text) or (
+            "?" in text and any(k in text.lower() for k in ("status", "what do you know", "recall", "remember"))
+        ):
             detected_intent = "memory_query"
             epistemic_hint = EpistemicType.FACT.value
 

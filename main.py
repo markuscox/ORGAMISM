@@ -1,4 +1,4 @@
-"""CLI entrypoint for running discrete ORGANISM wake cycles, resumptions, approvals, and benchmarks."""
+"""CLI entrypoint for running discrete ORGANISM wake cycles, resumptions, approvals, experiments, and benchmarks."""
 
 from __future__ import annotations
 
@@ -8,13 +8,13 @@ import sys
 import uuid
 
 from organism.config.settings import load_config
-from organism.evaluation.benchmarks import run_stage1_benchmarks
+from organism.evaluation.benchmarks import run_all_benchmarks
 from organism.kernel.contracts import CognitiveEvent, TrustLevel
 from organism.kernel.runtime import CognitiveKernel
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="ORGANISM Stage 1 Cognitive Kernel CLI")
+    parser = argparse.ArgumentParser(description="ORGANISM Stage 2 Cognitive Kernel CLI")
     parser.add_argument("--state-dir", default=None, help="Override state directory path")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -48,8 +48,14 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument("--cycle-id", required=True, help="Cycle ID in WAITING state")
     approve.add_argument("--decision", required=True, choices=["approve", "reject"])
 
+    exp = sub.add_parser("experiment", help="Execute a safe bounded active-learning probe")
+    exp.add_argument("--id", "--exp-id", dest="exp_id", required=True, help="Experiment ID to execute")
+
+    sub.add_parser("consolidate", help="Run forgetting, Fisher EWC anchoring, replay rehearsal, and probe scan")
+    sub.add_parser("replay", help="Run EWC-anchored continual learning replay rehearsal")
+    sub.add_parser("forget", help="Run controlled selective forgetting on stale unverified clutter")
     sub.add_parser("status", help="Output full persisted organism state as JSON")
-    sub.add_parser("eval", help="Run Stage 1 automated capability benchmarks")
+    sub.add_parser("eval", help="Run Stage 1 + Stage 2 automated capability benchmarks")
     return parser
 
 
@@ -64,9 +70,31 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "eval":
-        report = run_stage1_benchmarks(record_to_store=kernel)
+        report = run_all_benchmarks(record_to_store=kernel)
         print(json.dumps(report, indent=2, ensure_ascii=True))
         return 0 if report["failed"] == 0 else 1
+
+    if args.command == "experiment":
+        res = kernel.run_active_experiment(args.exp_id)
+        print(json.dumps({"experiment": res, "state": kernel.get_full_state()}, indent=2, ensure_ascii=True))
+        return 0 if res is not None else 1
+
+    if args.command == "consolidate":
+        res = kernel.run_maintenance_consolidation()
+        print(json.dumps({"consolidation": res, "state": kernel.get_full_state()}, indent=2, ensure_ascii=True))
+        return 0
+
+    if args.command == "replay":
+        res = kernel.continual.replay_rehearsal()
+        kernel.store.export_snapshot()
+        print(json.dumps({"replay": res, "state": kernel.get_full_state()}, indent=2, ensure_ascii=True))
+        return 0
+
+    if args.command == "forget":
+        res = kernel.retriever.apply_controlled_forgetting()
+        kernel.store.export_snapshot()
+        print(json.dumps({"forgetting": res, "state": kernel.get_full_state()}, indent=2, ensure_ascii=True))
+        return 0
 
     if args.command == "wake":
         op_id = args.operation_id or f"op_{uuid.uuid4().hex[:12]}"
@@ -89,7 +117,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "resume":
-        # If no interrupted cycle, check due deferred events first
         cp = kernel.resume_cycle(
             cycle_id=args.cycle_id,
             approved_by_human=bool(args.approved),

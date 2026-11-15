@@ -46,7 +46,14 @@ export interface CycleCheckpoint {
   }>;
   perception_data: Record<string, unknown>;
   plan: Record<string, unknown>;
-  prediction: Record<string, unknown>;
+  prediction: {
+    model_source?: string;
+    sample_count?: number;
+    predicted_probability?: number;
+    transition_entropy?: number;
+    expected_outcome?: string;
+    [key: string]: unknown;
+  };
   risk_assessment: Record<string, unknown>;
   executive_decision: Record<string, unknown>;
   action_result: {
@@ -57,9 +64,27 @@ export interface CycleCheckpoint {
     payload?: Record<string, unknown>;
     error?: string | null;
   };
-  comparison: Record<string, unknown>;
-  metacognition: Record<string, unknown>;
+  comparison: {
+    td_error?: number;
+    brier_term?: number;
+    matched?: boolean;
+    [key: string]: unknown;
+  };
+  metacognition: {
+    brier_score?: number;
+    refrain_recommended?: boolean;
+    refrain_reasons?: string[];
+    confidence_axes?: {
+      prediction_confidence?: number;
+      source_confidence?: number;
+      memory_confidence?: number;
+      reasoning_confidence?: number;
+      [key: string]: unknown;
+    };
+    [key: string]: unknown;
+  };
   homeostasis: Record<string, number>;
+  active_learning?: Record<string, unknown>;
   step_traces: StepTrace[];
   tokens_used: number;
   outcome_summary: string;
@@ -79,6 +104,8 @@ export interface EpisodicRecord {
   outcome_status: CycleStatus;
   outcome_summary: string;
   metadata: Record<string, unknown>;
+  prev_episode_id?: string | null;
+  sequence_index?: number;
   created_at: string;
 }
 
@@ -94,6 +121,24 @@ export interface SemanticFact {
   valid_from: string;
   invalidated_at: string | null;
   superseded_by: string | null;
+  evidence_count?: number;
+  contradiction_count?: number;
+  access_count?: number;
+  last_accessed_at?: string | null;
+  activation_score?: number;
+  forgotten_at?: string | null;
+}
+
+export interface EvidenceRecord {
+  evidence_id: string;
+  fact_id: string;
+  episode_id: string;
+  source: string;
+  trust_level: string;
+  stance: string;
+  weight: number;
+  rationale: string;
+  created_at: string;
 }
 
 export interface KnowledgeGraphEdge {
@@ -115,6 +160,74 @@ export interface WorkingMemorySlot {
   epistemic_type: EpistemicType;
   source: string;
   expires_at_cycle: number;
+  created_at: string;
+}
+
+export interface WorldTransition {
+  state_action_key: string;
+  state_key: string;
+  action_key: string;
+  alpha_counts: Record<string, number>;
+  det_alpha: number;
+  det_beta: number;
+  td_error_ema: number;
+  avg_tokens_ema: number;
+  fisher_precision: number;
+  anchor_alpha: Record<string, number>;
+  sample_count: number;
+  updated_at: string;
+}
+
+export interface PredictionHistoryRow {
+  pred_id: string;
+  cycle_id: string;
+  state_action_key: string;
+  predicted_status: string;
+  predicted_prob: number;
+  actual_status: string;
+  matched: number;
+  brier_term: number;
+  td_error: number;
+  created_at: string;
+}
+
+export interface ActiveExperiment {
+  experiment_id: string;
+  target_fact_id: string | null;
+  target_key: string;
+  hypothesis: string;
+  uncertainty_entropy: number;
+  expected_info_gain: number;
+  estimated_cost: number;
+  evi_score: number;
+  proposed_probe: string;
+  status: string;
+  result_summary: string | null;
+  info_gain_realized: number | null;
+  created_at: string;
+  executed_at: string | null;
+}
+
+export interface OrganMetric {
+  organ_name: string;
+  executions: number;
+  successes: number;
+  degraded_count: number;
+  error_count: number;
+  avg_duration_ms: number;
+  reliability_ema: number;
+  updated_at: string;
+}
+
+export interface ReplayExperience {
+  replay_id: string;
+  state_key: string;
+  action_key: string;
+  observed_status: string;
+  observed_det: number;
+  observed_tokens: number;
+  regime_tag: string;
+  priority: number;
   created_at: string;
 }
 
@@ -158,8 +271,15 @@ export interface EvaluationRun {
   total: number;
   metrics: {
     score: number;
+    brier_score?: number;
     checks: Record<string, boolean>;
     llm_calls_during_benchmark?: number;
+    historical_comparison?: {
+      previous_run_id?: string;
+      previous_score?: number | null;
+      score_delta?: number;
+      regression_detected?: boolean;
+    };
   };
   created_at: string;
 }
@@ -211,5 +331,12 @@ export interface OrganismFullState {
   deferred_queue: DeferredItem[];
   safety_audits: SafetyAuditEntry[];
   evaluation_runs: EvaluationRun[];
+  world_transitions: WorldTransition[];
+  prediction_history: PredictionHistoryRow[];
+  evidence_records: EvidenceRecord[];
+  active_experiments: ActiveExperiment[];
+  organ_metrics: OrganMetric[];
+  replay_buffer: ReplayExperience[];
+  replay_buffer_count?: number;
   snapshot_integrity_valid: boolean;
 }

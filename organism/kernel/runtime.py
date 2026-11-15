@@ -1,9 +1,9 @@
-"""Central Cognitive Kernel orchestrating the 16-step recoverable wake cycle."""
+"""Central Cognitive Kernel orchestrating the 16-step recoverable wake cycle (Stage 1 + Stage 2)."""
 
 from __future__ import annotations
 
 import uuid
-from typing import Any, Callable
+from typing import Any
 
 from organism.config.settings import OrganismConfig, load_config
 from organism.kernel.contracts import (
@@ -15,13 +15,12 @@ from organism.kernel.contracts import (
     OrganReport,
     StepStatus,
     StepTrace,
-    TrustLevel,
-    utc_now_iso,
 )
 from organism.kernel.event_bus import EventBus
 from organism.kernel.scheduler import WakeScheduler
 from organism.kernel.state_machine import CYCLE_STEPS, CycleStateMachine
 from organism.memory.consolidation import MemoryConsolidator
+from organism.memory.continual import ContinualLearningManager
 from organism.memory.knowledge_graph import TemporalKnowledgeGraph
 from organism.memory.retrieval import MemoryRetriever
 from organism.memory.storage import SQLiteMemoryStore
@@ -29,6 +28,7 @@ from organism.models.context_compiler import ContextCompiler
 from organism.models.gemini import GeminiProvider
 from organism.models.provider import ModelProvider
 from organism.models.usage_budget import UsageBudgetManager
+from organism.organs.active_learning import ActiveLearningOrgan
 from organism.organs.attention import AttentionOrgan
 from organism.organs.communication import CommunicationOrgan
 from organism.organs.episodic_memory import EpisodicMemoryOrgan
@@ -71,6 +71,7 @@ class CognitiveKernel:
         self.kg = TemporalKnowledgeGraph(self.store)
         self.retriever = MemoryRetriever(self.store)
         self.consolidator = MemoryConsolidator(self.store, self.kg)
+        self.continual = ContinualLearningManager(self.store)
         self.budget = UsageBudgetManager(self.store, self.config)
         self.compiler = ContextCompiler(char_limit=self.config.context_char_limit)
         self.audit = SafetyAuditLogger(self.store)
@@ -98,11 +99,12 @@ class CognitiveKernel:
         self.procedural_memory = ProceduralMemoryOrgan(self.store)
         self.reasoning = ReasoningOrgan(self.provider, self.budget, self.compiler)
         self.planner = PlannerOrgan()
-        self.world_model = WorldModelOrgan()
+        self.world_model = WorldModelOrgan(store=self.store, continual=self.continual)
         self.executive = ExecutiveOrgan()
-        self.metacognition = MetacognitionOrgan()
+        self.metacognition = MetacognitionOrgan(store=self.store)
         self.motivation = MotivationOrgan()
         self.learning = LearningOrgan(self.consolidator)
+        self.active_learning = ActiveLearningOrgan(self.store, self.kg)
         self.immunity = ImmunityOrgan(self.audit, self.budget)
         self.communication = CommunicationOrgan()
 
@@ -112,14 +114,16 @@ class CognitiveKernel:
         context: dict[str, Any],
         fault_organ: str | None = None,
     ) -> OrganReport:
-        """Executes an organ inside a fault-isolation boundary."""
+        """Executes an organ inside a fault-isolation boundary and tracks organ reliability."""
         try:
             if fault_organ and organ.name == fault_organ:
                 raise RuntimeError(f"Injected test fault in organ '{organ.name}'")
             report = organ.execute(context)
             IntegrityValidator.validate_organ_report(report)
+            self.store.record_organ_metric(organ.name, report.status.value, report.duration_ms)
             return report
         except Exception as exc:
+            self.store.record_organ_metric(organ.name, StepStatus.ERROR.value, 0.0)
             return OrganReport(
                 organ_name=organ.name,
                 status=StepStatus.ERROR,
@@ -139,7 +143,6 @@ class CognitiveKernel:
         simulate_fault_organ: str | None = None,
     ) -> CycleCheckpoint:
         """Execute a discrete 16-step cognitive wake cycle with idempotency and checkpoints."""
-        # Idempotency check: never silently repeat an already completed operation
         existing_done = self.store.check_idempotency(event.operation_id)
         if existing_done is not None:
             prior_cp = self.store.get_checkpoint(existing_done["cycle_id"])
@@ -189,7 +192,6 @@ class CognitiveKernel:
         if checkpoint.status == CycleStatus.WAITING:
             CycleStateMachine.validate_status_transition(checkpoint.status, CycleStatus.RUNNING)
             checkpoint.status = CycleStatus.RUNNING
-            # Re-evaluate from Step 9 when human approval is provided
             if approved_by_human and checkpoint.current_step >= 9:
                 checkpoint.current_step = 8
                 checkpoint.step_traces = [t for t in checkpoint.step_traces if t.step_number <= 8]
@@ -309,7 +311,7 @@ class CognitiveKernel:
                 )
                 check_crash(2)
 
-            # Step 3: Retrieve Memories
+            # Step 3: Retrieve Memories (ACT-R activation + spacing reinforcement)
             if checkpoint.current_step < 3:
                 query = str(checkpoint.perception_data.get("normalized_text", event.content))
                 memories = self.retriever.retrieve(query, top_k=self.config.retrieval_top_k)
@@ -445,16 +447,21 @@ class CognitiveKernel:
                 )
                 check_crash(7)
 
-            # Step 8: Predict Outcomes
+            # Step 8: Predict Outcomes (Adaptive World Model Posterior)
             if checkpoint.current_step < 8:
                 rep = self._run_organ_isolated(
                     self.world_model,
-                    {"phase": "predict", "plan": checkpoint.plan, "perception": checkpoint.perception_data},
+                    {
+                        "phase": "predict",
+                        "plan": checkpoint.plan,
+                        "perception": checkpoint.perception_data,
+                        "memories_count": len(checkpoint.retrieved_memories),
+                    },
                     simulate_fault_organ,
                 )
                 if rep.status == StepStatus.ERROR:
                     degraded_organs.append(self.world_model.name)
-                    checkpoint.prediction = {"expected_status": "ok", "expected_deterministic": True}
+                    checkpoint.prediction = {"expected_status": "ok", "expected_deterministic": True, "predicted_probability": 0.5}
                 else:
                     checkpoint.prediction = rep.payload
                 record_step(
@@ -463,7 +470,11 @@ class CognitiveKernel:
                     rep.status if rep.status != StepStatus.ERROR else StepStatus.DEGRADED,
                     True,
                     0,
-                    f"Predicted status={checkpoint.prediction.get('expected_status')}, deterministic={checkpoint.prediction.get('expected_deterministic')}",
+                    (
+                        f"Predicted {checkpoint.prediction.get('expected_status')} "
+                        f"(p={checkpoint.prediction.get('predicted_probability', 0.5)}, "
+                        f"src={checkpoint.prediction.get('model_source', 'prior')})"
+                    ),
                     checkpoint.prediction,
                     rep.duration_ms,
                 )
@@ -610,14 +621,16 @@ class CognitiveKernel:
                 )
                 check_crash(12)
 
-            # Step 13: Compare Result with Prediction
+            # Step 13: Compare Result with Prediction & Update Adaptive World Model
             if checkpoint.current_step < 13:
                 rep = self._run_organ_isolated(
                     self.world_model,
                     {
                         "phase": "compare",
+                        "cycle_id": checkpoint.cycle_id,
                         "prediction": checkpoint.prediction,
                         "observed": checkpoint.action_result,
+                        "regime_tag": checkpoint.mode,
                     },
                     simulate_fault_organ,
                 )
@@ -632,7 +645,7 @@ class CognitiveKernel:
                     rep.status if rep.status != StepStatus.ERROR else StepStatus.DEGRADED,
                     True,
                     0,
-                    f"Prediction matched={checkpoint.comparison.get('matched_prediction')}, error={checkpoint.comparison.get('prediction_error')}",
+                    f"Matched={checkpoint.comparison.get('matched_prediction')}, err={checkpoint.comparison.get('prediction_error')}, brier={checkpoint.comparison.get('brier_term')}",
                     checkpoint.comparison,
                     rep.duration_ms,
                 )
@@ -645,11 +658,15 @@ class CognitiveKernel:
                     {
                         "prior_metacognition": identity.get("metacognition", {}),
                         "comparison": checkpoint.comparison,
+                        "prediction": checkpoint.prediction,
+                        "perception": checkpoint.perception_data,
+                        "retrieved_memories": checkpoint.retrieved_memories,
                         "reasoning_report": {
                             "confidence": checkpoint.action_result.get("confidence", 0.5),
                             "epistemic_type": checkpoint.action_result.get("payload", {}).get("epistemic_type", "unknown"),
                         },
                         "degraded_organs": degraded_organs,
+                        "tokens_used": checkpoint.tokens_used,
                     },
                     simulate_fault_organ,
                 )
@@ -664,7 +681,7 @@ class CognitiveKernel:
                     rep.status if rep.status != StepStatus.ERROR else StepStatus.DEGRADED,
                     True,
                     0,
-                    f"Calibration={checkpoint.metacognition.get('calibration_score')}, gap={checkpoint.metacognition.get('knowledge_gap_detected')}",
+                    f"Brier={checkpoint.metacognition.get('brier_score')}, abstain={checkpoint.metacognition.get('refrain_recommended')}",
                     checkpoint.metacognition,
                     rep.duration_ms,
                 )
@@ -689,6 +706,7 @@ class CognitiveKernel:
                             "tokens_used": checkpoint.tokens_used,
                             "degraded_organs": degraded_organs,
                             "epistemic_type": checkpoint.action_result.get("payload", {}).get("epistemic_type", "unknown"),
+                            "refrain_recommended": bool(checkpoint.metacognition.get("refrain_recommended", False)),
                         },
                     },
                     simulate_fault_organ,
@@ -709,8 +727,9 @@ class CognitiveKernel:
                 )
                 check_crash(15)
 
-            # Step 16: Consolidate into Long-Term Memory
+            # Step 16: Evidence-Based Consolidation & Active Learning Proposals
             if checkpoint.current_step < 16:
+                refrain = bool(checkpoint.metacognition.get("refrain_recommended", False))
                 rep = self._run_organ_isolated(
                     self.learning,
                     {
@@ -718,23 +737,45 @@ class CognitiveKernel:
                         "reasoning_payload": checkpoint.action_result.get("payload", {}),
                         "perception": checkpoint.perception_data,
                         "outcome_status": CycleStatus.COMPLETED.value,
+                        "refrain_recommended": refrain,
                     },
                     simulate_fault_organ,
                 )
                 if rep.status == StepStatus.ERROR:
                     degraded_organs.append(self.learning.name)
 
+                al_rep = self._run_organ_isolated(
+                    self.active_learning,
+                    {"cycle_id": checkpoint.cycle_id},
+                    simulate_fault_organ,
+                )
+                if al_rep.status == StepStatus.ERROR:
+                    degraded_organs.append(self.active_learning.name)
+                    checkpoint.active_learning = {}
+                else:
+                    checkpoint.active_learning = al_rep.payload
+
+                if cycle_number % 10 == 0:
+                    self.retriever.apply_controlled_forgetting()
+
                 CycleStateMachine.validate_status_transition(checkpoint.status, CycleStatus.COMPLETED)
                 checkpoint.status = CycleStatus.COMPLETED
+                combined_data = {
+                    **rep.payload,
+                    "active_learning": checkpoint.active_learning,
+                }
                 record_step(
                     16,
                     self.learning.name,
                     rep.status if rep.status != StepStatus.ERROR else StepStatus.DEGRADED,
                     True,
                     0,
-                    f"Consolidated {rep.payload.get('consolidated_count', 0)} durable memory assertion(s)",
-                    rep.payload,
-                    rep.duration_ms,
+                    (
+                        f"Staged {rep.payload.get('consolidated_count', 0)} assertion(s); "
+                        f"active_learning={checkpoint.active_learning.get('proposals_count', 0)} proposal(s)"
+                    ),
+                    combined_data,
+                    round(rep.duration_ms + al_rep.duration_ms, 3),
                 )
 
             # Update persistent identity, idempotency, and resolve deferred queue if applicable
@@ -806,6 +847,27 @@ class CognitiveKernel:
             degraded_organs=[],
         )
 
+    def run_active_experiment(self, experiment_id: str) -> dict[str, Any] | None:
+        """Execute a bounded, safe internal curiosity probe proposed by ActiveLearningOrgan."""
+        result = self.active_learning.run_safe_experiment(experiment_id)
+        if result is not None:
+            self.store.export_snapshot()
+        return result
+
+    def run_maintenance_consolidation(self) -> dict[str, Any]:
+        """Run sleep-like offline consolidation: forgetting clutter, EWC anchoring, replay, and probe scan."""
+        forgotten = self.consolidator.run_controlled_forgetting()
+        anchored = self.continual.consolidate_fisher_anchors()
+        replay = self.continual.replay_rehearsal(batch_size=self.config.replay_batch_size)
+        al_rep = self._run_organ_isolated(self.active_learning, {})
+        self.store.export_snapshot()
+        return {
+            "forgotten": forgotten,
+            "anchored_transitions": anchored,
+            "replay": replay,
+            "active_learning": al_rep.payload,
+        }
+
     def get_full_state(self) -> dict[str, Any]:
         return {
             "identity": self.store.get_identity(),
@@ -820,12 +882,21 @@ class CognitiveKernel:
             "usage_ledger": self.store.list_usage_ledger(limit=14),
             "checkpoints": self.store.list_checkpoints(limit=25),
             "episodes": self.store.list_episodes(limit=40),
-            "semantic_facts": self.store.list_semantic_facts(include_invalidated=True, limit=60),
+            "semantic_facts": self.store.list_semantic_facts(
+                include_invalidated=True, include_forgotten=True, limit=80
+            ),
             "kg_edges": self.store.list_kg_edges(limit=50),
             "working_memory": self.store.list_working_memory(),
             "procedures": self.store.list_procedures(),
             "deferred_queue": self.store.list_deferred(),
             "safety_audits": self.store.list_safety_audits(limit=40),
-            "evaluation_runs": self.store.list_evaluation_runs(limit=10),
+            "evaluation_runs": self.store.list_evaluation_runs(limit=15),
+            "world_transitions": self.store.list_world_transitions(limit=50),
+            "prediction_history": self.store.list_prediction_history(limit=60),
+            "evidence_records": self.store.list_recent_evidence(limit=50),
+            "active_experiments": self.store.list_active_experiments(limit=30),
+            "organ_metrics": self.store.list_organ_metrics(),
+            "replay_buffer": self.store.list_replay_buffer(limit=30),
+            "replay_buffer_count": len(self.store.list_replay_buffer(limit=200)),
             "snapshot_integrity_valid": self.store.verify_snapshot_file(),
         }

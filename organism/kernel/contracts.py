@@ -1,4 +1,4 @@
-"""Documented module contracts, enums, and state dataclasses for ORGANISM."""
+"""Documented module contracts, enums, and state dataclasses for ORGANISM (Stage 1 + Stage 2)."""
 
 from __future__ import annotations
 
@@ -45,13 +45,17 @@ class EpistemicType(str, Enum):
 
 
 class MemoryStatus(str, Enum):
+    OBSERVED = "observed"
     CANDIDATE = "candidate"
+    EVIDENCE_CHECKED = "evidence_checked"
     TESTED = "tested"
     VERIFIED = "verified"
+    REJECTED = "rejected"
     APPROVED = "approved"
     ACTIVE = "active"
     INVALIDATED = "invalidated"
     DEPRECATED = "deprecated"
+    FORGOTTEN = "forgotten"
 
 
 class StepStatus(str, Enum):
@@ -168,6 +172,7 @@ class CycleCheckpoint:
     metacognition: dict[str, Any] = field(default_factory=dict)
     homeostasis: dict[str, Any] = field(default_factory=dict)
     consolidation_candidates: list[dict[str, Any]] = field(default_factory=list)
+    active_learning: dict[str, Any] = field(default_factory=dict)
     step_traces: list[StepTrace] = field(default_factory=list)
     tokens_used: int = 0
     outcome_summary: str = ""
@@ -205,6 +210,7 @@ class CycleCheckpoint:
             metacognition=dict(raw.get("metacognition", {})),
             homeostasis=dict(raw.get("homeostasis", {})),
             consolidation_candidates=list(raw.get("consolidation_candidates", [])),
+            active_learning=dict(raw.get("active_learning", {})),
             step_traces=[StepTrace.from_dict(t) for t in raw.get("step_traces", [])],
             tokens_used=int(raw.get("tokens_used", 0)),
             outcome_summary=str(raw.get("outcome_summary", "")),

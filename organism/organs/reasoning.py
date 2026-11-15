@@ -103,6 +103,7 @@ class ReasoningOrgan(OrganContract):
 
         intent = perception.get("detected_intent", "analysis")
         text = str(perception.get("normalized_text", ""))
+        is_untrusted = bool(perception.get("is_untrusted_data", False))
 
         # 1. Exact deterministic mathematical computation
         if intent == "math_computation" and perception.get("math_expression"):
@@ -141,7 +142,7 @@ class ReasoningOrgan(OrganContract):
                     duration_ms=round((time.perf_counter() - t0) * 1000, 3),
                 )
 
-        # 2. Deterministic knowledge assertion & contradiction check
+        # 2. Deterministic knowledge assertion & evidence staging
         if intent == "knowledge_assertion" and perception.get("extracted_triple"):
             triple = perception["extracted_triple"]
             ep_type = perception.get("epistemic_hint", EpistemicType.HYPOTHESIS.value)
@@ -152,6 +153,8 @@ class ReasoningOrgan(OrganContract):
                 and triple["subject"].lower() in m["summary"].lower()
                 and triple["object_value"].lower() not in m["summary"].lower()
             ]
+            # Stage 2: single observation enters as candidate unless corroborated
+            conf = 0.6 if not is_untrusted else 0.35
             self._budget.record_deterministic_resolution()
             return OrganReport(
                 organ_name=self.name,
@@ -162,17 +165,17 @@ class ReasoningOrgan(OrganContract):
                     "triple": triple,
                     "contradictions": contradictions,
                     "answer": (
-                        f"Recorded {ep_type}: {triple['subject']} {triple['predicate']} {triple['object_value']}"
-                        + (f" (supersedes/conflicts with {len(contradictions)} prior record(s))" if contradictions else "")
+                        f"Staged {ep_type} candidate: {triple['subject']} {triple['predicate']} {triple['object_value']}"
+                        + (f" (conflicts with {len(contradictions)} prior record(s))" if contradictions else "")
                     ),
                 },
-                confidence=0.9 if ep_type == EpistemicType.FACT.value else 0.55,
+                confidence=conf,
                 tokens_used=0,
                 deterministic=True,
                 duration_ms=round((time.perf_counter() - t0) * 1000, 3),
             )
 
-        # 3. Deterministic hypothesis framing (never promote unverified hypothesis to fact!)
+        # 3. Deterministic hypothesis framing (never promote unverified hypothesis to fact)
         if intent == "hypothesis_evaluation":
             self._budget.record_deterministic_resolution()
             return OrganReport(
@@ -181,7 +184,7 @@ class ReasoningOrgan(OrganContract):
                 payload={
                     "resolution_type": "epistemic_classification",
                     "epistemic_type": EpistemicType.HYPOTHESIS.value,
-                    "answer": f"Classified as unverified hypothesis (requires empirical verification): {text}",
+                    "answer": f"Classified as unverified hypothesis (requires corroborating evidence): {text}",
                     "evidence": [m["summary"] for m in memories[:3]],
                 },
                 confidence=0.45,
@@ -190,17 +193,21 @@ class ReasoningOrgan(OrganContract):
                 duration_ms=round((time.perf_counter() - t0) * 1000, 3),
             )
 
-        # 4. Deterministic memory recall query
+        # 4. Deterministic memory recall query (filter confidence & lifecycle status)
         if intent == "memory_query":
             self._budget.record_deterministic_resolution()
             if memories:
-                summary_lines = "; ".join(f"[{m['epistemic_type']}] {m['summary']}" for m in memories[:3])
+                summary_lines = "; ".join(
+                    f"[{m.get('status', 'active')}/{m['epistemic_type']}] {m['summary']}"
+                    for m in memories[:3]
+                )
+                top_conf = float(memories[0].get("confidence", 0.7))
                 answer = f"Retrieved {len(memories)} relevant record(s): {summary_lines}"
-                conf = 0.85
-                ep = EpistemicType.FACT.value
+                conf = round(min(0.95, max(0.45, top_conf)), 4)
+                ep = memories[0].get("epistemic_type", EpistemicType.FACT.value)
             else:
-                answer = "Unknown: no matching records exist in persistent memory yet."
-                conf = 0.9
+                answer = "Refrained / Unknown: no supporting records exist in persistent memory yet."
+                conf = 0.25
                 ep = EpistemicType.UNKNOWN.value
             return OrganReport(
                 organ_name=self.name,
@@ -217,22 +224,23 @@ class ReasoningOrgan(OrganContract):
                 duration_ms=round((time.perf_counter() - t0) * 1000, 3),
             )
 
-        # 5. Deterministic-only mode avoids external LLM calls
+        # 5. Deterministic-only mode refrains from speculative synthesis
         if mode == "deterministic_only":
             self._budget.record_deterministic_resolution()
             return OrganReport(
                 organ_name=self.name,
                 status=StepStatus.OK,
                 payload={
-                    "resolution_type": "deterministic_symbolic_fallback",
+                    "resolution_type": "deterministic_abstention" if not memories else "deterministic_symbolic_fallback",
                     "epistemic_type": EpistemicType.UNKNOWN.value,
                     "answer": (
-                        f"Processed deterministically without LLM synthesis. "
-                        f"Matched {len(memories)} memory item(s); open synthesis marked unknown."
+                        "Refrained from concluding: insufficient deterministic evidence for open synthesis."
+                        if not memories
+                        else f"Matched {len(memories)} memory item(s) deterministically; open synthesis remains unknown."
                     ),
                     "evidence": [m["summary"] for m in memories[:3]],
                 },
-                confidence=0.5,
+                confidence=0.3 if not memories else 0.48,
                 tokens_used=0,
                 deterministic=True,
                 duration_ms=round((time.perf_counter() - t0) * 1000, 3),
@@ -262,7 +270,6 @@ class ReasoningOrgan(OrganContract):
             )
 
         if not self._provider.is_configured():
-            # Graceful deterministic fallback if GEMINI_API_KEY is absent in offline CI/preview
             self._budget.record_deterministic_resolution()
             return OrganReport(
                 organ_name=self.name,
@@ -271,12 +278,12 @@ class ReasoningOrgan(OrganContract):
                     "resolution_type": "offline_deterministic_fallback",
                     "epistemic_type": EpistemicType.UNKNOWN.value,
                     "answer": (
-                        "Model credentials unavailable; completed deterministic triage only. "
+                        "Model credentials unavailable; refrained from unverified synthesis. "
                         f"Retrieved {len(memories)} memory item(s)."
                     ),
                     "evidence": [m["summary"] for m in memories[:3]],
                 },
-                confidence=0.4,
+                confidence=0.35,
                 tokens_used=0,
                 deterministic=True,
                 error="GEMINI_API_KEY not configured; fell back to deterministic mode.",
@@ -308,7 +315,7 @@ class ReasoningOrgan(OrganContract):
                     "prompt_tokens": resp.prompt_tokens,
                     "completion_tokens": resp.completion_tokens,
                 },
-                confidence=0.72,
+                confidence=0.68,
                 tokens_used=resp.total_tokens,
                 deterministic=False,
                 duration_ms=round((time.perf_counter() - t0) * 1000, 3),
@@ -333,9 +340,9 @@ class ReasoningOrgan(OrganContract):
                 payload={
                     "resolution_type": "provider_error_fallback",
                     "epistemic_type": EpistemicType.UNKNOWN.value,
-                    "answer": f"Model provider unavailable ({exc}); retained safe deterministic state.",
+                    "answer": f"Model provider unavailable ({exc}); refrained safely.",
                 },
-                confidence=0.35,
+                confidence=0.3,
                 tokens_used=0,
                 deterministic=True,
                 error=str(exc),

@@ -152,6 +152,50 @@ async function startServer() {
     }
   });
 
+  // Execute a safe bounded active-learning probe
+  app.post(["/api/experiments/run", "/api/experiment/run"], async (req, res) => {
+    try {
+      const { experimentId } = req.body || {};
+      if (typeof experimentId !== "string" || !experimentId.trim()) {
+        return res.status(400).json({ error: "experimentId is required." });
+      }
+      const result = await runPythonCli(["experiment", "--id", experimentId.trim().slice(0, 64)]);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || "Experiment execution failed" });
+    }
+  });
+
+  // Run controlled forgetting, Fisher EWC anchoring, and replay rehearsal
+  app.post("/api/memory/consolidate", async (_req, res) => {
+    try {
+      const result = await runPythonCli(["consolidate"]);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || "Memory consolidation failed" });
+    }
+  });
+
+  // Trigger EWC-anchored continual learning replay rehearsal
+  app.post("/api/continual/replay", async (_req, res) => {
+    try {
+      const result = await runPythonCli(["replay"]);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || "Replay rehearsal failed" });
+    }
+  });
+
+  // Trigger controlled selective forgetting of stale unverified clutter
+  app.post("/api/memory/forget", async (_req, res) => {
+    try {
+      const result = await runPythonCli(["forget"]);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || "Controlled forgetting failed" });
+    }
+  });
+
   // Reset local runtime state cleanly for fresh experiment runs
   app.post("/api/state/reset", async (_req, res) => {
     try {

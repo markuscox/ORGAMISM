@@ -21,7 +21,18 @@
     "workspace_capacity": 7,
     "working_memory_capacity": 12,
     "working_memory_ttl_cycles": 6,
-    "retrieval_top_k": 5
+    "retrieval_top_k": 5,
+    "decay_rate": 0.5,
+    "max_candidate_retention": 40
+  },
+  "stage2": {
+    "world_model_prior_alpha": 1.0,
+    "world_model_td_lr": 0.25,
+    "ewc_lambda": 0.5,
+    "replay_batch_size": 8,
+    "metacog_abstain_threshold": 0.42,
+    "evidence_verify_threshold": 0.78,
+    "evidence_min_independent_sources": 2
   },
   "storage": {
     "state_dir": "state",

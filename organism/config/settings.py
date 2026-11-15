@@ -30,6 +30,16 @@ class OrganismConfig:
     state_dir: Path
     db_path: Path
     snapshot_path: Path
+    # Stage 2 adaptive cognition parameters
+    memory_decay_rate: float = 0.5
+    max_candidate_retention: int = 40
+    world_model_prior_alpha: float = 1.0
+    world_model_td_lr: float = 0.25
+    ewc_lambda: float = 0.5
+    replay_batch_size: int = 8
+    metacog_abstain_threshold: float = 0.42
+    evidence_verify_threshold: float = 0.78
+    evidence_min_independent_sources: int = 2
 
 
 def _deep_get(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -87,7 +97,7 @@ def load_config(
 
     return OrganismConfig(
         organism_id=_deep_get(raw, "identity", "organism_id", default="organism-stage1-alpha"),
-        version=_deep_get(raw, "identity", "version", default="0.1.0-stage1"),
+        version=_deep_get(raw, "identity", "version", default="0.2.0-stage2"),
         model_provider=_deep_get(raw, "model", "provider", default="gemini"),
         model_name=model_name,
         timeout_seconds=int(_deep_get(raw, "model", "timeout_seconds", default=20)),
@@ -105,4 +115,15 @@ def load_config(
         state_dir=resolved_state_dir,
         db_path=resolved_state_dir / db_filename,
         snapshot_path=resolved_state_dir / snapshot_filename,
+        memory_decay_rate=float(_deep_get(raw, "memory", "decay_rate", default=0.5)),
+        max_candidate_retention=int(_deep_get(raw, "memory", "max_candidate_retention", default=40)),
+        world_model_prior_alpha=float(_deep_get(raw, "stage2", "world_model_prior_alpha", default=1.0)),
+        world_model_td_lr=float(_deep_get(raw, "stage2", "world_model_td_lr", default=0.25)),
+        ewc_lambda=float(_deep_get(raw, "stage2", "ewc_lambda", default=0.5)),
+        replay_batch_size=int(_deep_get(raw, "stage2", "replay_batch_size", default=8)),
+        metacog_abstain_threshold=float(_deep_get(raw, "stage2", "metacog_abstain_threshold", default=0.42)),
+        evidence_verify_threshold=float(_deep_get(raw, "stage2", "evidence_verify_threshold", default=0.78)),
+        evidence_min_independent_sources=int(
+            _deep_get(raw, "stage2", "evidence_min_independent_sources", default=2)
+        ),
     )

@@ -1,5 +1,6 @@
 """Modular cognitive organs package for ORGANISM."""
 
+from .active_learning import ActiveLearningOrgan
 from .attention import AttentionOrgan
 from .communication import CommunicationOrgan
 from .episodic_memory import EpisodicMemoryOrgan
@@ -18,6 +19,7 @@ from .workspace import GlobalWorkspaceOrgan
 from .world_model import WorldModelOrgan
 
 __all__ = [
+    "ActiveLearningOrgan",
     "AttentionOrgan",
     "CommunicationOrgan",
     "EpisodicMemoryOrgan",
