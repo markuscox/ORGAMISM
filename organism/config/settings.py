@@ -96,7 +96,7 @@ def load_config(
 
     return OrganismConfig(
         organism_id=_deep_get(raw, "identity", "organism_id", default="organism-stage1-alpha"),
-        version=_deep_get(raw, "identity", "version", default="0.2.0-stage2"),
+        version=_deep_get(raw, "identity", "version", default="0.3.2-stage3.2"),
         model_provider=_deep_get(raw, "model", "provider", default="gemini"),
         model_name=model_name,
         timeout_seconds=int(_deep_get(raw, "model", "timeout_seconds", default=20)),

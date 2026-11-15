@@ -1,4 +1,4 @@
-# ORGANISM — Stage 3: Secure Telegram Interface, Multilingual Cognition, Encrypted Persistence & Hardened Observatory
+# ORGANISM — Stage 3.2: Secure Telegram Interface, Multilingual Cognition, Encrypted Persistence & Verified CI
 
 ORGANISM is an experimental, modular artificial cognitive system built around discrete, checkpointed 16-step wake cycles, fault-isolated organs, Bayesian/statistical learning, epistemic provenance, token-economy budgets, and security-first boundaries.
 
