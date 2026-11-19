@@ -3,5 +3,5 @@
   "cipher": "Fernet-AES128-CBC-HMAC-SHA256",
   "backend": "cryptography.fernet",
   "file_count": 2,
-  "ciphertext_sha256": "84d489068a59246887a0b4571a16ed24968a873789dadc17554c4c2496a161bc"
+  "ciphertext_sha256": "9c43041d705a25854305bd773b14920e1f548149f6e9631a107355eee0a90cd5"
 }
